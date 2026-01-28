@@ -27,6 +27,8 @@
     headerTitle: '收藏夹可视化管理器',
     favoriteIntervalMs: 3000,
     favoriteFid: '0',
+    thumbWidth: 170,
+    thumbHeight: 227,
   };
 
   const state = {
@@ -34,6 +36,8 @@
     uiPerPage: 20,
     favoriteTimer: null,
     favoriteQueue: [],
+    windowedBounds: null,
+    isFullscreen: false,
   };
 
   const domain = window.location.origin;
@@ -323,6 +327,11 @@
     title.textContent = settings.headerTitle;
     const actions = document.createElement('div');
     actions.className = 'jm-header-actions';
+    const maximize = document.createElement('button');
+    maximize.type = 'button';
+    maximize.textContent = '⬜';
+    maximize.title = '切换全屏';
+    maximize.addEventListener('click', () => toggleFullscreen(container));
     const minimize = document.createElement('button');
     minimize.type = 'button';
     minimize.textContent = '—';
@@ -335,7 +344,7 @@
     close.addEventListener('click', () => {
       container.remove();
     });
-    actions.append(minimize, close);
+    actions.append(maximize, minimize, close);
     header.append(title, actions);
     container.appendChild(header);
     makeDraggable(container, header);
@@ -529,7 +538,7 @@
     const importScopeSelect = document.createElement('select');
     importScopeSelect.innerHTML = `
       <option value="current">导入到当前文件夹</option>
-      <option value="all">按数据合并到全部文件夹</option>
+      <option value="merge-folders">按文件夹名称合并/创建</option>
     `;
     importScopeRow.append(importScopeSelect);
     const importHint = document.createElement('div');
@@ -720,7 +729,7 @@
     return JSON.stringify(data, null, 2);
   }
 
-  function formatBase64(data) {
+  function encodeBase64(data) {
     return btoa(unescape(encodeURIComponent(formatRaw(data))));
   }
 
@@ -753,7 +762,7 @@
       downloadFile(formatTxtData(data), `jmcomic-export-${timestamp}.txt`);
     }
     if (formatBase64) {
-      downloadFile(formatBase64(data), `jmcomic-export-${timestamp}.b64.txt`);
+      downloadFile(encodeBase64(data), `jmcomic-export-${timestamp}.b64.txt`);
     }
     if (formatRaw) {
       downloadFile(formatRaw(data), `jmcomic-export-${timestamp}.json`);
@@ -791,7 +800,7 @@
           const [id, ...titleParts] = line.split(/\s+/);
           return { id, title: titleParts.join(' ') };
         });
-      if (scope === 'all') {
+      if (scope === 'merge-folders') {
         const name = `TXT导入-${new Date().toLocaleString()}`;
         createFolder(name);
         const folder = getActiveFolder();
@@ -820,7 +829,7 @@
       return;
     }
 
-    if (scope === 'all') {
+    if (scope === 'merge-folders') {
       const folders = getFolders();
       const mergedFolders = [...folders];
       parsed.folders.forEach((incoming) => {
@@ -914,6 +923,33 @@
     }
   }
 
+  function toggleFullscreen(container) {
+    if (!state.isFullscreen) {
+      const rect = container.getBoundingClientRect();
+      state.windowedBounds = {
+        left: container.style.left || `${rect.left}px`,
+        top: container.style.top || `${rect.top}px`,
+        width: container.style.width || `${rect.width}px`,
+        height: container.style.height || `${rect.height}px`,
+      };
+      container.classList.add('fullscreen');
+      container.style.left = '0px';
+      container.style.top = '0px';
+      container.style.width = '100vw';
+      container.style.height = '100vh';
+      state.isFullscreen = true;
+    } else {
+      container.classList.remove('fullscreen');
+      if (state.windowedBounds) {
+        container.style.left = state.windowedBounds.left;
+        container.style.top = state.windowedBounds.top;
+        container.style.width = state.windowedBounds.width;
+        container.style.height = state.windowedBounds.height;
+      }
+      state.isFullscreen = false;
+    }
+  }
+
   function makeDraggable(container, handle) {
     let startX = 0;
     let startY = 0;
@@ -956,6 +992,11 @@
     container.className = 'jm-container';
     container.style.left = '30px';
     container.style.top = '30px';
+    container.style.width = '820px';
+    container.style.height = '720px';
+    const settings = getSettings();
+    container.style.setProperty('--jm-thumb-width', `${settings.thumbWidth}px`);
+    container.style.setProperty('--jm-thumb-height', `${settings.thumbHeight}px`);
 
     buildHeader(container);
     buildTabs(container);
@@ -999,8 +1040,6 @@
     GM_addStyle(`
       .jm-container {
         position: fixed;
-        width: 820px;
-        height: 720px;
         background: #1f1f1f;
         color: #fff;
         border-radius: 12px;
@@ -1009,6 +1048,16 @@
         display: flex;
         flex-direction: column;
         font-family: "Segoe UI", "PingFang SC", sans-serif;
+        resize: both;
+        overflow: hidden;
+        min-width: 680px;
+        min-height: 520px;
+        max-width: 100vw;
+        max-height: 100vh;
+      }
+      .jm-container.fullscreen {
+        border-radius: 0;
+        resize: none;
       }
       .jm-container.minimized .jm-tabs,
       .jm-container.minimized .jm-tab-content {
@@ -1084,10 +1133,11 @@
       .jm-grid {
         flex: 1;
         display: grid;
-        grid-template-columns: repeat(4, 1fr);
+        grid-template-columns: repeat(auto-fill, minmax(var(--jm-thumb-width, 170px), 1fr));
         gap: 12px;
         overflow-y: auto;
         padding-right: 4px;
+        align-content: start;
       }
       .jm-card {
         background: #2d2d2d;
@@ -1099,9 +1149,10 @@
       }
       .jm-card img {
         width: 100%;
-        height: auto;
+        height: var(--jm-thumb-height, 227px);
         border-radius: 6px;
         background: #1a1a1a;
+        object-fit: cover;
       }
       .jm-card-title {
         font-size: 14px;
@@ -1190,7 +1241,8 @@
         align-items: center;
       }
       .jm-form-row input[type="text"],
-      .jm-form-row input[type="number"] {
+      .jm-form-row input[type="number"],
+      .jm-form-row select {
         margin-left: 6px;
         padding: 4px 6px;
         border-radius: 4px;
