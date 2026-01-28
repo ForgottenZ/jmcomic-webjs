@@ -29,6 +29,8 @@
     favoriteFid: '0',
     thumbWidth: 170,
     thumbHeight: 227,
+    autoSyncFavoriteAdd: true,
+    autoSyncFavoriteDelete: true,
   };
 
   const state = {
@@ -185,6 +187,16 @@
         nextItems[item.id].title = item.title;
       }
     });
+    return { ...folder, items: nextItems, order: nextOrder };
+  }
+
+  function removeItemFromFolder(folder, id) {
+    if (!folder.items[id]) {
+      return folder;
+    }
+    const nextItems = { ...folder.items };
+    delete nextItems[id];
+    const nextOrder = folder.order.filter((itemId) => itemId !== id);
     return { ...folder, items: nextItems, order: nextOrder };
   }
 
@@ -513,6 +525,11 @@
       <label><input type="radio" name="export-scope" value="current" checked> 当前文件夹</label>
       <label><input type="radio" name="export-scope" value="all"> 全部文件夹</label>
     `;
+    const settingsRow = document.createElement('div');
+    settingsRow.className = 'jm-form-row';
+    settingsRow.innerHTML = `
+      <label><input type="checkbox" data-export-settings> 同时导出设置</label>
+    `;
 
     const exportBtn = document.createElement('button');
     exportBtn.type = 'button';
@@ -522,10 +539,11 @@
       const formatBase64 = formatRow.querySelector('input[data-format="base64"]').checked;
       const formatRaw = formatRow.querySelector('input[data-format="raw"]').checked;
       const scope = scopeRow.querySelector('input[name="export-scope"]:checked').value;
-      handleExport({ formatTxt, formatBase64, formatRaw, scope });
+      const includeSettings = settingsRow.querySelector('input[data-export-settings]').checked;
+      handleExport({ formatTxt, formatBase64, formatRaw, scope, includeSettings });
     });
 
-    exportSection.append(formatRow, scopeRow, exportBtn);
+    exportSection.append(formatRow, scopeRow, settingsRow, exportBtn);
 
     const importSection = document.createElement('div');
     importSection.className = 'jm-section';
@@ -592,6 +610,12 @@
       <label>一键收藏间隔（ms）<input type="number" min="500" value="${settings.favoriteIntervalMs}"></label>
       <label>fid <input type="text" value="${settings.favoriteFid}"></label>
     `;
+    const syncRow = document.createElement('div');
+    syncRow.className = 'jm-form-row';
+    syncRow.innerHTML = `
+      <label><input type="checkbox" data-sync-add ${settings.autoSyncFavoriteAdd ? 'checked' : ''}> 自动同步收藏新增</label>
+      <label><input type="checkbox" data-sync-delete ${settings.autoSyncFavoriteDelete ? 'checked' : ''}> 自动同步收藏删除</label>
+    `;
 
     const saveBtn = document.createElement('button');
     saveBtn.type = 'button';
@@ -599,10 +623,14 @@
     saveBtn.addEventListener('click', () => {
       const intervalInput = favoriteRow.querySelector('input[type="number"]');
       const fidInput = favoriteRow.querySelector('input[type="text"]');
+      const syncAdd = syncRow.querySelector('input[data-sync-add]').checked;
+      const syncDelete = syncRow.querySelector('input[data-sync-delete]').checked;
       setSettings({
         headerTitle: headerInput.value.trim() || DEFAULT_SETTINGS.headerTitle,
         favoriteIntervalMs: Math.max(500, Number(intervalInput.value) || DEFAULT_SETTINGS.favoriteIntervalMs),
         favoriteFid: fidInput.value.trim() || DEFAULT_SETTINGS.favoriteFid,
+        autoSyncFavoriteAdd: syncAdd,
+        autoSyncFavoriteDelete: syncDelete,
       });
       notify('设置已保存。');
       const header = document.querySelector('.jm-title');
@@ -611,7 +639,7 @@
       }
     });
 
-    panel.append(headerRow, favoriteRow, saveBtn);
+    panel.append(headerRow, favoriteRow, syncRow, saveBtn);
     content.appendChild(panel);
   }
 
@@ -685,32 +713,46 @@
       const item = folder.items[id];
       const card = document.createElement('div');
       card.className = 'jm-card';
+      const link = document.createElement('a');
+      link.href = `${domain}/album/${id}/`;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
       const img = document.createElement('img');
       img.alt = item?.title || '';
       img.src = `${domain}/media/albums/${id}_3x4.jpg`;
+      link.appendChild(img);
       const title = document.createElement('div');
       title.className = 'jm-card-title';
       title.textContent = item?.title || '未命名';
       const meta = document.createElement('div');
       meta.className = 'jm-card-meta';
       meta.textContent = `ID: ${id}`;
-      card.append(img, title, meta);
+      card.append(link, title, meta);
       grid.appendChild(card);
     });
 
     pageInfo.textContent = `第 ${state.uiPage} / ${totalPages} 页，共 ${ids.length} 条`;
   }
 
-  function exportFolderData(scope) {
+  function exportFolderData(scope, includeSettings) {
     const folders = getFolders();
+    const payload = { folders };
+    if (!includeSettings) {
+      delete payload.settings;
+    } else {
+      payload.settings = getSettings();
+    }
     if (scope === 'all') {
-      return { folders };
+      return payload;
     }
     const current = getActiveFolder();
     if (!current) {
-      return { folders: [] };
+      return { folders: [], settings: includeSettings ? getSettings() : undefined };
     }
-    return { folders: [current] };
+    return {
+      folders: [current],
+      settings: includeSettings ? getSettings() : undefined,
+    };
   }
 
   function formatTxt(data) {
@@ -747,7 +789,7 @@
     }
   }
 
-  function handleExport({ formatTxt, formatBase64, formatRaw, scope }) {
+  function handleExport({ formatTxt, formatBase64, formatRaw, scope, includeSettings }) {
     if (!formatTxt && !formatBase64 && !formatRaw) {
       notify('请至少选择一种导出格式。');
       return;
@@ -756,7 +798,7 @@
       notify('Base64 与原样 JSON 不能同时选择。');
       return;
     }
-    const data = exportFolderData(scope);
+    const data = exportFolderData(scope, includeSettings);
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     if (formatTxt) {
       downloadFile(formatTxtData(data), `jmcomic-export-${timestamp}.txt`);
@@ -923,6 +965,86 @@
     }
   }
 
+  function parseAlbumIdFromBody(body) {
+    if (!body) {
+      return null;
+    }
+    if (body instanceof URLSearchParams) {
+      return body.get('album_id');
+    }
+    if (body instanceof FormData) {
+      return body.get('album_id');
+    }
+    if (typeof body !== 'string') {
+      return null;
+    }
+    const params = new URLSearchParams(body);
+    return params.get('album_id');
+  }
+
+  function syncFavoriteChange(action, albumId) {
+    if (!albumId) {
+      return;
+    }
+    const settings = getSettings();
+    if (action === 'add' && !settings.autoSyncFavoriteAdd) {
+      return;
+    }
+    if (action === 'delete' && !settings.autoSyncFavoriteDelete) {
+      return;
+    }
+    const folder = getActiveFolder();
+    if (!folder) {
+      return;
+    }
+    if (action === 'add') {
+      const updated = addItemsToFolder(folder, [{ id: albumId, title: folder.items[albumId]?.title || '' }]);
+      updateFolder(updated);
+      refreshGrid();
+      return;
+    }
+    const updated = removeItemFromFolder(folder, albumId);
+    updateFolder(updated);
+    refreshGrid();
+  }
+
+  function interceptAjax() {
+    const originalFetch = window.fetch;
+    if (originalFetch) {
+      window.fetch = function (...args) {
+        const [input, init] = args;
+        const url = typeof input === 'string' ? input : input?.url || '';
+        const body = init?.body;
+        if (typeof url === 'string') {
+          if (url.includes('/ajax/favorite_album')) {
+            syncFavoriteChange('add', parseAlbumIdFromBody(body));
+          } else if (url.includes('/ajax/delete_favorite_album')) {
+            syncFavoriteChange('delete', parseAlbumIdFromBody(body));
+          }
+        }
+        return originalFetch.apply(this, args);
+      };
+    }
+
+    const originalOpen = XMLHttpRequest.prototype.open;
+    const originalSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+      this._jmUrl = url;
+      return originalOpen.call(this, method, url, ...rest);
+    };
+    XMLHttpRequest.prototype.send = function (body) {
+      const url = this._jmUrl || '';
+      if (typeof url === 'string') {
+        if (url.includes('/ajax/favorite_album')) {
+          syncFavoriteChange('add', parseAlbumIdFromBody(body));
+        } else if (url.includes('/ajax/delete_favorite_album')) {
+          syncFavoriteChange('delete', parseAlbumIdFromBody(body));
+        }
+      }
+      return originalSend.call(this, body);
+    };
+  }
+
   function toggleFullscreen(container) {
     if (!state.isFullscreen) {
       const rect = container.getBoundingClientRect();
@@ -1012,6 +1134,7 @@
       if (!domains.includes(domain)) {
         setApprovedDomains([...domains, domain]);
         notify('已认可当前域名，请刷新页面生效。');
+        window.alert('已认可当前域名，请刷新页面生效。');
       } else {
         notify('当前域名已被认可。');
       }
@@ -1032,6 +1155,7 @@
 
     addStyles();
     ensureDefaultFolder();
+    interceptAjax();
     mountUI();
     processCaptureState();
   }
