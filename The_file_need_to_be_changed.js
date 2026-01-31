@@ -24,6 +24,9 @@
     // 自动关闭相关推荐开关 & 观察器
     let autoCancelEnabled = true;
     let relatedObserver = null;
+    let autoCancelScheduled = false;
+    let lastAutoCancelRun = 0;
+    let lastCancelAutoplayAt = 0;
 
     // 剪贴板处理选项：
     // 'ask'       每次询问
@@ -451,6 +454,17 @@
         const btns = document.querySelectorAll('.bpx-player-ending-related-item-cancel');
         if (!btns.length) return;
         btns.forEach(btn => {
+            const label = (btn.textContent || '').trim();
+            const isCancelAutoplay = label.includes('取消连播');
+
+            if (isCancelAutoplay) {
+                const now = Date.now();
+                if (now - lastCancelAutoplayAt < 1500) return;
+                btn.click();
+                lastCancelAutoplayAt = now;
+                return;
+            }
+
             if (!btn.dataset.__autoClicked) {
                 btn.click();
                 btn.dataset.__autoClicked = '1';
@@ -462,7 +476,16 @@
         if (relatedObserver) return;
 
         relatedObserver = new MutationObserver(() => {
-            clickAllCancelBtns();
+            if (autoCancelScheduled) return;
+            autoCancelScheduled = true;
+            requestAnimationFrame(() => {
+                const now = Date.now();
+                if (now - lastAutoCancelRun > 100) {
+                    clickAllCancelBtns();
+                    lastAutoCancelRun = now;
+                }
+                autoCancelScheduled = false;
+            });
         });
 
         if (document.body) {
