@@ -36,11 +36,16 @@
   const state = {
     uiPage: 1,
     uiPerPage: 20,
+    searchQuery: '',
+    sortField: 'addedAt',
+    sortAsc: true,
     favoriteTimer: null,
     favoriteQueue: [],
     windowedBounds: null,
     isFullscreen: false,
   };
+
+  const ENCRYPTED_EXPORT_MARKER = 'VGhpcyBqYXZhc2NyaXB0IGlzIG1hZGUgYnkgTHVvYm8gd2l0aCBBSS4gVGtzIGZvciB1c2luZyBteSB3b3JrIQ==';
 
   const domain = window.location.origin;
 
@@ -149,6 +154,10 @@
       url.searchParams.set('page', String(page));
     }
     window.location.href = url.toString();
+  }
+
+  function hasPrevnextButton() {
+    return Boolean(document.querySelector('.prevnext'));
   }
 
   function captureCurrentPage() {
@@ -269,6 +278,15 @@
     updateFolder(updatedFolder);
 
     if (currentPage >= maxPages) {
+      if (hasPrevnextButton()) {
+        setCaptureState({
+          ...captureState,
+          page: currentPage + 1,
+          maxPages: currentPage + 1,
+        });
+        navigateToPage(currentPage + 1);
+        return;
+      }
       notify(`获取完成，共 ${updatedFolder.order.length} 条。`);
       clearCaptureState();
       refreshGrid();
@@ -419,12 +437,10 @@
 
     const exportBtn = document.createElement('button');
     exportBtn.type = 'button';
-    exportBtn.textContent = '快速导出 TXT';
+    exportBtn.textContent = '快速导出明文';
     exportBtn.addEventListener('click', () => {
       handleExport({
-        formatTxt: true,
-        formatBase64: false,
-        formatRaw: false,
+        mode: 'plain',
         scope: 'current',
       });
     });
@@ -441,6 +457,42 @@
 
     actions.append(startBtn, pauseBtn, exportBtn, favoriteBtn, stopFavoriteBtn);
 
+    const tools = document.createElement('div');
+    tools.className = 'jm-form-row jm-album-tools';
+    const searchInput = document.createElement('input');
+    searchInput.type = 'text';
+    searchInput.placeholder = '按 ID 或名字模糊搜索';
+    searchInput.addEventListener('input', () => {
+      state.searchQuery = searchInput.value.trim();
+      state.uiPage = 1;
+      refreshGrid();
+    });
+
+    const sortSelect = document.createElement('select');
+    sortSelect.innerHTML = `
+      <option value="addedAt">按照添加时间顺序排序</option>
+      <option value="id">按照 ID 大小排序</option>
+    `;
+    sortSelect.addEventListener('change', () => {
+      state.sortField = sortSelect.value;
+      state.uiPage = 1;
+      refreshGrid();
+    });
+
+    const sortOrderBtn = document.createElement('button');
+    sortOrderBtn.type = 'button';
+    const refreshSortText = () => {
+      sortOrderBtn.textContent = state.sortAsc ? '从小到大' : '从大到小';
+    };
+    refreshSortText();
+    sortOrderBtn.addEventListener('click', () => {
+      state.sortAsc = !state.sortAsc;
+      refreshSortText();
+      refreshGrid();
+    });
+
+    tools.append(searchInput, sortSelect, sortOrderBtn);
+
     const grid = document.createElement('div');
     grid.className = 'jm-grid';
 
@@ -450,10 +502,9 @@
     prevBtn.type = 'button';
     prevBtn.textContent = '上一页';
     prevBtn.addEventListener('click', () => {
-      if (state.uiPage > 1) {
-        state.uiPage -= 1;
-        refreshGrid();
-      }
+      const totalPages = getGridTotalPages();
+      state.uiPage = state.uiPage <= 1 ? totalPages : state.uiPage - 1;
+      refreshGrid();
     });
     const pageInfo = document.createElement('span');
     pageInfo.className = 'jm-page-info';
@@ -461,12 +512,31 @@
     nextBtn.type = 'button';
     nextBtn.textContent = '下一页';
     nextBtn.addEventListener('click', () => {
-      state.uiPage += 1;
+      const totalPages = getGridTotalPages();
+      state.uiPage = state.uiPage >= totalPages ? 1 : state.uiPage + 1;
       refreshGrid();
     });
-    pager.append(prevBtn, pageInfo, nextBtn);
+    const jumpWrap = document.createElement('div');
+    jumpWrap.className = 'jm-jump-wrap';
+    jumpWrap.innerHTML = `跳转至 <input type="number" min="1" class="jm-jump-input"> 页`;
+    const jumpInput = jumpWrap.querySelector('input');
+    const jumpBtn = document.createElement('button');
+    jumpBtn.type = 'button';
+    jumpBtn.textContent = '跳转';
+    jumpBtn.addEventListener('click', () => {
+      const totalPages = getGridTotalPages();
+      const target = Number(jumpInput.value);
+      if (!target || target < 1 || target > totalPages) {
+        notify(`请输入 1-${totalPages} 之间的页码。`);
+        return;
+      }
+      state.uiPage = target;
+      refreshGrid();
+    });
+    jumpWrap.appendChild(jumpBtn);
+    pager.append(prevBtn, pageInfo, nextBtn, jumpWrap);
 
-    panel.append(actions, grid, pager);
+    panel.append(actions, tools, grid, pager);
     content.appendChild(panel);
   }
 
@@ -511,12 +581,11 @@
     exportSection.className = 'jm-section';
     exportSection.innerHTML = '<h4>导出设置</h4>';
 
-    const formatRow = document.createElement('div');
-    formatRow.className = 'jm-form-row';
-    formatRow.innerHTML = `
-      <label><input type="checkbox" data-format="txt"> TXT 输出</label>
-      <label><input type="checkbox" data-format="base64"> Base64 输出</label>
-      <label><input type="checkbox" data-format="raw"> 原样 JSON 输出</label>
+    const modeRow = document.createElement('div');
+    modeRow.className = 'jm-form-row';
+    modeRow.innerHTML = `
+      <label><input type="radio" name="export-mode" value="plain" checked> 明文导出</label>
+      <label><input type="radio" name="export-mode" value="encrypted"> 加密导出</label>
     `;
 
     const scopeRow = document.createElement('div');
@@ -525,25 +594,17 @@
       <label><input type="radio" name="export-scope" value="current" checked> 当前文件夹</label>
       <label><input type="radio" name="export-scope" value="all"> 全部文件夹</label>
     `;
-    const settingsRow = document.createElement('div');
-    settingsRow.className = 'jm-form-row';
-    settingsRow.innerHTML = `
-      <label><input type="checkbox" data-export-settings> 同时导出设置</label>
-    `;
 
     const exportBtn = document.createElement('button');
     exportBtn.type = 'button';
     exportBtn.textContent = '执行导出';
     exportBtn.addEventListener('click', () => {
-      const formatTxt = formatRow.querySelector('input[data-format="txt"]').checked;
-      const formatBase64 = formatRow.querySelector('input[data-format="base64"]').checked;
-      const formatRaw = formatRow.querySelector('input[data-format="raw"]').checked;
+      const mode = modeRow.querySelector('input[name="export-mode"]:checked').value;
       const scope = scopeRow.querySelector('input[name="export-scope"]:checked').value;
-      const includeSettings = settingsRow.querySelector('input[data-export-settings]').checked;
-      handleExport({ formatTxt, formatBase64, formatRaw, scope, includeSettings });
+      handleExport({ mode, scope });
     });
 
-    exportSection.append(formatRow, scopeRow, settingsRow, exportBtn);
+    exportSection.append(modeRow, scopeRow, exportBtn);
 
     const importSection = document.createElement('div');
     importSection.className = 'jm-section';
@@ -561,10 +622,10 @@
     importScopeRow.append(importScopeSelect);
     const importHint = document.createElement('div');
     importHint.className = 'jm-hint';
-    importHint.textContent = '支持 TXT、Base64 或 JSON 原样数据。';
+    importHint.textContent = '支持明文导入和加密导入（自动识别）。';
     const importBtn = document.createElement('button');
     importBtn.type = 'button';
-    importBtn.textContent = '导入到当前文件夹';
+    importBtn.textContent = '执行导入';
     importBtn.addEventListener('click', () => {
       if (!ensureFolderExists()) {
         return;
@@ -683,6 +744,41 @@
     });
   }
 
+  function getFilteredSortedIds(folder) {
+    const keyword = state.searchQuery.toLowerCase();
+    const ids = folder.order.filter((id) => {
+      const item = folder.items[id];
+      if (!keyword) {
+        return true;
+      }
+      return id.toLowerCase().includes(keyword) || (item?.title || '').toLowerCase().includes(keyword);
+    });
+
+    return ids.sort((left, right) => {
+      const leftItem = folder.items[left] || {};
+      const rightItem = folder.items[right] || {};
+      const direction = state.sortAsc ? 1 : -1;
+      if (state.sortField === 'id') {
+        return (Number(left) - Number(right)) * direction;
+      }
+      const leftTime = Number(leftItem.addedAt) || 0;
+      const rightTime = Number(rightItem.addedAt) || 0;
+      if (leftTime === rightTime) {
+        return (Number(left) - Number(right)) * direction;
+      }
+      return (leftTime - rightTime) * direction;
+    });
+  }
+
+  function getGridTotalPages() {
+    const folder = getActiveFolder();
+    if (!folder) {
+      return 1;
+    }
+    const ids = getFilteredSortedIds(folder);
+    return Math.max(1, Math.ceil(ids.length / state.uiPerPage));
+  }
+
   function refreshGrid() {
     const grid = document.querySelector('.jm-grid');
     const pageInfo = document.querySelector('.jm-page-info');
@@ -696,7 +792,7 @@
       return;
     }
 
-    const ids = folder.order;
+    const ids = getFilteredSortedIds(folder);
     const totalPages = Math.max(1, Math.ceil(ids.length / state.uiPerPage));
     if (state.uiPage > totalPages) {
       state.uiPage = totalPages;
@@ -706,7 +802,7 @@
 
     grid.innerHTML = '';
     if (pageIds.length === 0) {
-      grid.innerHTML = '<div class="jm-empty">当前文件夹暂无收藏。</div>';
+      grid.innerHTML = '<div class="jm-empty">当前筛选条件下暂无收藏。</div>';
     }
 
     pageIds.forEach((id) => {
@@ -724,55 +820,71 @@
       const title = document.createElement('div');
       title.className = 'jm-card-title';
       title.textContent = item?.title || '未命名';
+      const bottom = document.createElement('div');
+      bottom.className = 'jm-card-bottom';
       const meta = document.createElement('div');
       meta.className = 'jm-card-meta';
       meta.textContent = `ID: ${id}`;
-      card.append(link, title, meta);
+      const deleteBtn = document.createElement('button');
+      deleteBtn.type = 'button';
+      deleteBtn.className = 'jm-delete-btn';
+      deleteBtn.textContent = '删除';
+      deleteBtn.addEventListener('click', () => {
+        if (!window.confirm(`确认删除 ID: ${id} 吗？`)) {
+          return;
+        }
+        if (!window.confirm('请再次确认：删除后不可恢复。')) {
+          return;
+        }
+        const nextFolder = removeItemFromFolder(folder, id);
+        updateFolder(nextFolder);
+        refreshGrid();
+        refreshFolderList();
+        notify(`已删除 ID: ${id}`);
+      });
+      bottom.append(meta, deleteBtn);
+      card.append(link, title, bottom);
       grid.appendChild(card);
     });
 
     pageInfo.textContent = `第 ${state.uiPage} / ${totalPages} 页，共 ${ids.length} 条`;
   }
 
-  function exportFolderData(scope, includeSettings) {
+  function exportFolderData(scope) {
     const folders = getFolders();
-    const payload = { folders };
-    if (!includeSettings) {
-      delete payload.settings;
-    } else {
-      payload.settings = getSettings();
-    }
     if (scope === 'all') {
-      return payload;
+      return { folders, settings: getSettings() };
     }
     const current = getActiveFolder();
     if (!current) {
-      return { folders: [], settings: includeSettings ? getSettings() : undefined };
+      return { folders: [], settings: getSettings() };
     }
     return {
       folders: [current],
-      settings: includeSettings ? getSettings() : undefined,
+      settings: getSettings(),
     };
   }
 
-  function formatTxt(data) {
+  function formatPlainExport(data) {
     const lines = [];
     data.folders.forEach((folder) => {
       lines.push(`# ${folder.name}`);
       folder.order.forEach((id) => {
         const item = folder.items[id];
-        lines.push(`${id}\t${item?.title || ''}`);
+        lines.push(`${id}	${item?.title || ''}`);
       });
     });
+    lines.push('# SETTINGS_JSON');
+    lines.push(JSON.stringify(data.settings || getSettings()));
     return lines.join('\n');
   }
 
-  function formatRaw(data) {
-    return JSON.stringify(data, null, 2);
+  function encodeBase64Text(content) {
+    return btoa(unescape(encodeURIComponent(content)));
   }
 
-  function encodeBase64(data) {
-    return btoa(unescape(encodeURIComponent(formatRaw(data))));
+  function decodeBase64Text(content) {
+    return decodeURIComponent(escape(atob(content)));
   }
 
   function downloadFile(content, filename) {
@@ -789,86 +901,94 @@
     }
   }
 
-  function handleExport({ formatTxt, formatBase64, formatRaw, scope, includeSettings }) {
-    if (!formatTxt && !formatBase64 && !formatRaw) {
-      notify('请至少选择一种导出格式。');
-      return;
-    }
-    if (formatBase64 && formatRaw) {
-      notify('Base64 与原样 JSON 不能同时选择。');
-      return;
-    }
-    const data = exportFolderData(scope, includeSettings);
+  function handleExport({ mode, scope }) {
+    const data = exportFolderData(scope);
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    if (formatTxt) {
-      downloadFile(formatTxtData(data), `jmcomic-export-${timestamp}.txt`);
+    const plain = formatPlainExport(data);
+    if (mode === 'encrypted') {
+      downloadFile(`${ENCRYPTED_EXPORT_MARKER}${encodeBase64Text(plain)}`, `jmcomic-export-${timestamp}.b64.txt`);
+      notify('加密导出完成。');
+      return;
     }
-    if (formatBase64) {
-      downloadFile(encodeBase64(data), `jmcomic-export-${timestamp}.b64.txt`);
-    }
-    if (formatRaw) {
-      downloadFile(formatRaw(data), `jmcomic-export-${timestamp}.json`);
-    }
-    notify('导出完成。');
+    downloadFile(plain, `jmcomic-export-${timestamp}.txt`);
+    notify('明文导出完成。');
   }
 
-  function formatTxtData(data) {
-    return formatTxt(data);
+  function parsePlainImport(content) {
+    const lines = content.split(/\r?\n/);
+    const folders = [];
+    let currentFolder = null;
+    let settingsJson = null;
+    let inSettings = false;
+
+    lines.forEach((rawLine) => {
+      const line = rawLine.trim();
+      if (!line) {
+        return;
+      }
+      if (line === '# SETTINGS_JSON') {
+        inSettings = true;
+        return;
+      }
+      if (inSettings) {
+        settingsJson = settingsJson ? `${settingsJson}${line}` : line;
+        return;
+      }
+      if (line.startsWith('#')) {
+        const name = line.replace(/^#\s*/, '').trim() || `导入文件夹-${Date.now()}`;
+        currentFolder = { name, items: {}, order: [] };
+        folders.push(currentFolder);
+        return;
+      }
+      if (!currentFolder) {
+        return;
+      }
+      const [id, ...titleParts] = line.split(/\s+/);
+      if (!/^\d+$/.test(id || '')) {
+        return;
+      }
+      const title = titleParts.join(' ').trim();
+      if (!currentFolder.items[id]) {
+        currentFolder.items[id] = {
+          id,
+          title,
+          addedAt: Date.now(),
+        };
+        currentFolder.order.push(id);
+      }
+    });
+
+    let settings = null;
+    if (settingsJson) {
+      try {
+        settings = JSON.parse(settingsJson);
+      } catch (error) {
+        settings = null;
+      }
+    }
+    return { folders, settings };
   }
 
   function importContent(content, scope) {
-    let parsed = null;
-    if (content.startsWith('{')) {
+    let plainText = content;
+    if (content.startsWith(ENCRYPTED_EXPORT_MARKER)) {
+      const encoded = content.slice(ENCRYPTED_EXPORT_MARKER.length).trim();
       try {
-        parsed = JSON.parse(content);
+        plainText = decodeBase64Text(encoded);
       } catch (error) {
-        parsed = null;
-      }
-    }
-    if (!parsed && /^[A-Za-z0-9+/=\s]+$/.test(content)) {
-      try {
-        const decoded = decodeURIComponent(escape(atob(content.trim())));
-        parsed = JSON.parse(decoded);
-      } catch (error) {
-        parsed = null;
+        notify('加密导入失败，无法解密。');
+        return;
       }
     }
 
-    if (!parsed) {
-      const lines = content.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-      const items = lines
-        .filter((line) => !line.startsWith('#'))
-        .map((line) => {
-          const [id, ...titleParts] = line.split(/\s+/);
-          return { id, title: titleParts.join(' ') };
-        });
-      if (scope === 'merge-folders') {
-        const name = `TXT导入-${new Date().toLocaleString()}`;
-        createFolder(name);
-        const folder = getActiveFolder();
-        if (!folder) {
-          return;
-        }
-        const updated = addItemsToFolder(folder, items);
-        updateFolder(updated);
-        refreshGrid();
-        notify('TXT 已导入到新文件夹。');
-        return;
-      }
-      const folder = getActiveFolder();
-      if (!folder) {
-        return;
-      }
-      const updated = addItemsToFolder(folder, items);
-      updateFolder(updated);
-      refreshGrid();
-      notify('TXT 导入完成。');
+    const parsed = parsePlainImport(plainText);
+    if (!parsed.folders.length) {
+      notify('导入内容为空或格式错误。');
       return;
     }
 
-    if (!parsed.folders || !Array.isArray(parsed.folders)) {
-      notify('导入数据格式错误。');
-      return;
+    if (parsed.settings && typeof parsed.settings === 'object') {
+      setSettings(parsed.settings);
     }
 
     if (scope === 'merge-folders') {
@@ -982,6 +1102,18 @@
     return params.get('album_id');
   }
 
+  function getSyncAddedTitle() {
+    const selectors = ['.book-name.mb-0#book-name', '.pull-left'];
+    for (const selector of selectors) {
+      const el = document.querySelector(selector);
+      const text = el?.textContent?.trim();
+      if (text) {
+        return text;
+      }
+    }
+    return '未定义';
+  }
+
   function syncFavoriteChange(action, albumId) {
     if (!albumId) {
       return;
@@ -998,7 +1130,8 @@
       return;
     }
     if (action === 'add') {
-      const updated = addItemsToFolder(folder, [{ id: albumId, title: folder.items[albumId]?.title || '' }]);
+      const fallbackTitle = folder.items[albumId]?.title || getSyncAddedTitle();
+      const updated = addItemsToFolder(folder, [{ id: albumId, title: fallbackTitle }]);
       updateFolder(updated);
       refreshGrid();
       return;
@@ -1289,11 +1422,26 @@
         font-size: 12px;
         color: #b0b0b0;
       }
+      .jm-card-bottom {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .jm-delete-btn {
+        border: none;
+        border-radius: 4px;
+        background: #a93a3a;
+        color: #fff;
+        font-size: 12px;
+        padding: 4px 8px;
+        cursor: pointer;
+      }
       .jm-pager {
         margin-top: 12px;
         display: flex;
         align-items: center;
-        justify-content: space-between;
+        gap: 8px;
+        flex-wrap: wrap;
       }
       .jm-pager button {
         background: #3a3a3a;
@@ -1302,6 +1450,15 @@
         padding: 6px 12px;
         border-radius: 6px;
         cursor: pointer;
+      }
+      .jm-jump-wrap {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        margin-left: auto;
+      }
+      .jm-jump-input {
+        width: 72px;
       }
       .jm-folder-list {
         display: flex;
