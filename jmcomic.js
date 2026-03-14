@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JMComic 收藏夹管理器
 // @namespace    https://example.com/
-// @version      0.2.0
+// @version      0.3.1
 // @description  收藏夹 ID 采集、分页浏览、导入导出与一键收藏
 // @match        https://*/*
 // @grant        GM_setValue
@@ -10,6 +10,7 @@
 // @grant        GM_addStyle
 // @grant        GM_xmlhttpRequest
 // @grant        GM_download
+// @connect      *
 // ==/UserScript==
 
 (function () {
@@ -21,6 +22,7 @@
     activeFolderId: 'activeFolderId',
     captureState: 'captureState',
     settings: 'settings',
+    dailySignRecord: 'dailySignRecord',
   };
 
   const DEFAULT_SETTINGS = {
@@ -31,6 +33,11 @@
     thumbHeight: 227,
     autoSyncFavoriteAdd: true,
     autoSyncFavoriteDelete: true,
+    dailySignAddress: '',
+    dailySignDailyId: '',
+    dailySignOldStep: '',
+    autoDailySignEnabled: true,
+    dailySignDebug: false,
   };
 
   const state = {
@@ -59,6 +66,24 @@
 
   function isDomainApproved() {
     return getApprovedDomains().includes(domain);
+  }
+
+  function addApprovedDomainByInput(rawInput) {
+    const origin = normalizeSignOrigin(rawInput);
+    if (!origin) {
+      return { ok: false, reason: 'invalid' };
+    }
+    const domains = getApprovedDomains();
+    if (domains.includes(origin)) {
+      return { ok: false, reason: 'exists', origin };
+    }
+    setApprovedDomains([...domains, origin]);
+    return { ok: true, origin };
+  }
+
+  function removeApprovedDomain(targetOrigin) {
+    const next = getApprovedDomains().filter((item) => item !== targetOrigin);
+    setApprovedDomains(next);
   }
 
   function getSettings() {
@@ -98,16 +123,232 @@
     setFolders(next);
   }
 
-  function notify(message) {
+  function notify(message, options = {}) {
+    const { position = 'bottom-right', duration = 2600 } = options;
     const toast = document.createElement('div');
-    toast.className = 'jm-toast';
+    toast.className = 'jm-notify-toast';
+    if (position === 'top-right') {
+      toast.classList.add('top-right');
+    }
     toast.textContent = message;
     document.body.appendChild(toast);
     setTimeout(() => toast.classList.add('show'), 10);
     setTimeout(() => {
       toast.classList.remove('show');
       setTimeout(() => toast.remove(), 300);
-    }, 2600);
+    }, duration);
+  }
+
+  function getDailySignRecord() {
+    return GM_getValue(STORAGE_KEYS.dailySignRecord, {
+      lastAttemptDate: '',
+      lastSuccessDate: '',
+      lastStatus: 'idle',
+    });
+  }
+
+  function setDailySignRecord(partial) {
+    const current = getDailySignRecord();
+    GM_setValue(STORAGE_KEYS.dailySignRecord, {
+      ...current,
+      ...partial,
+      updatedAt: Date.now(),
+    });
+  }
+
+  function getTodayKey() {
+    const now = new Date();
+    const y = now.getFullYear();
+    const m = String(now.getMonth() + 1).padStart(2, '0');
+    const d = String(now.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  }
+
+  function normalizeSignOrigin(rawAddress) {
+    const raw = String(rawAddress || '').trim();
+    if (!raw) {
+      return '';
+    }
+    const withProtocol = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+    try {
+      const parsed = new URL(withProtocol);
+      return parsed.origin;
+    } catch (error) {
+      return '';
+    }
+  }
+
+  function buildDailySignPayload(config) {
+    return `daily_id=${encodeURIComponent(config.dailySignDailyId)}&oldStep=${encodeURIComponent(
+      config.dailySignOldStep
+    )}`;
+  }
+
+  function ensureDailySignConfig(settings, manual) {
+    const signOrigin = normalizeSignOrigin(settings.dailySignAddress);
+    if (!signOrigin) {
+      if (manual) {
+        notify('签到地址未设置或格式错误。');
+      }
+      return null;
+    }
+
+    const dailyId = String(settings.dailySignDailyId || '').trim();
+    const oldStep = String(settings.dailySignOldStep || '').trim();
+    if (!dailyId || !oldStep) {
+      if (manual) {
+        notify('请先设置签到参数 daily_id 和 oldStep。');
+      }
+      return null;
+    }
+
+    return {
+      signOrigin,
+      dailySignDailyId: dailyId,
+      dailySignOldStep: oldStep,
+    };
+  }
+
+  function triggerDailySign(options = {}) {
+    const { manual = false } = options;
+    if (window.top !== window.self) {
+      return;
+    }
+
+    const settings = getSettings();
+    const debugEnabled = Boolean(settings.dailySignDebug);
+    if (!manual && !settings.autoDailySignEnabled) {
+      if (debugEnabled) {
+        console.log('[JM签到调试] 已跳过自动签到：开关关闭', {
+          page: window.location.href,
+        });
+      }
+      return;
+    }
+
+    const config = ensureDailySignConfig(settings, manual);
+    if (!config) {
+      if (debugEnabled) {
+        console.log('[JM签到调试] 已跳过签到：配置不完整', {
+          dailySignAddress: settings.dailySignAddress || '',
+          dailySignDailyId: settings.dailySignDailyId || '',
+          dailySignOldStep: settings.dailySignOldStep || '',
+        });
+      }
+      return;
+    }
+
+    const today = getTodayKey();
+    const record = getDailySignRecord();
+    if (!manual && record.lastAttemptDate === today) {
+      if (debugEnabled) {
+        console.log('[JM签到调试] 已跳过自动签到：今日已触发', {
+          today,
+          lastAttemptDate: record.lastAttemptDate,
+          lastStatus: record.lastStatus,
+        });
+      }
+      return;
+    }
+
+    if (!manual) {
+      setDailySignRecord({
+        lastAttemptDate: today,
+        lastStatus: 'pending',
+      });
+    }
+
+    const url = `${config.signOrigin}/ajax/user_daily_sign`;
+    const payload = buildDailySignPayload(config);
+    if (debugEnabled) {
+      console.log('[JM签到调试] 发送签到请求', {
+        page: window.location.href,
+        manual,
+        url,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        },
+        data: payload,
+        today,
+      });
+    }
+    notify(`已触发今日签到请求：${config.signOrigin}`, { position: 'top-right' });
+
+    GM_xmlhttpRequest({
+      method: 'POST',
+      url,
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      },
+      data: payload,
+      timeout: 15000,
+      onload: (response) => {
+        const success = response.status >= 200 && response.status < 300;
+        setDailySignRecord({
+          lastAttemptDate: today,
+          lastSuccessDate: success ? today : record.lastSuccessDate || '',
+          lastStatus: success ? 'success' : `http_${response.status}`,
+        });
+        if (debugEnabled) {
+          console.log('[JM签到调试] 签到响应', {
+            success,
+            status: response.status,
+            responseText: response.responseText,
+            finalUrl: url,
+            requestData: payload,
+          });
+        }
+        if (manual) {
+          notify(success ? '签到请求已发送。' : `签到失败（HTTP ${response.status}）。`, { position: 'top-right' });
+        }
+      },
+      onerror: (error) => {
+        setDailySignRecord({
+          lastAttemptDate: today,
+          lastStatus: 'network_error',
+        });
+        if (debugEnabled) {
+          console.log('[JM签到调试] 签到请求网络错误', {
+            error,
+            finalUrl: url,
+            requestData: payload,
+          });
+        }
+        if (manual) {
+          notify('签到请求失败（网络错误）。', { position: 'top-right' });
+        }
+      },
+      ontimeout: () => {
+        setDailySignRecord({
+          lastAttemptDate: today,
+          lastStatus: 'timeout',
+        });
+        if (debugEnabled) {
+          console.log('[JM签到调试] 签到请求超时', {
+            finalUrl: url,
+            requestData: payload,
+          });
+        }
+        if (manual) {
+          notify('签到请求超时。', { position: 'top-right' });
+        }
+      },
+    });
+  }
+
+  function showDailySignStatus() {
+    const settings = getSettings();
+    const record = getDailySignRecord();
+    const signOrigin = normalizeSignOrigin(settings.dailySignAddress) || '未设置';
+    const autoText = settings.autoDailySignEnabled ? '开启' : '关闭';
+    const lastDate = record.lastAttemptDate || '无';
+    const status = record.lastStatus || 'idle';
+    const debugText = settings.dailySignDebug ? '开启' : '关闭';
+    notify(`自动签到:${autoText} 调试:${debugText} 地址:${signOrigin} 最近:${lastDate} 状态:${status}`, {
+      position: 'top-right',
+      duration: 4200,
+    });
   }
 
   function generateId(prefix) {
@@ -386,6 +627,7 @@
     const tabButtons = [
       { id: 'albums', label: '画廊列表' },
       { id: 'folders', label: '文件夹管理' },
+      { id: 'trusted-domains', label: '信任域名管理' },
       { id: 'export', label: '导入/导出' },
       { id: 'settings', label: '设置' },
     ];
@@ -413,6 +655,7 @@
     container.append(tabs, content);
     buildAlbumsPanel(content);
     buildFolderPanel(content);
+    buildTrustedDomainPanel(content);
     buildExportPanel(content);
     buildSettingsPanel(content);
   }
@@ -572,6 +815,48 @@
     content.appendChild(panel);
   }
 
+  function buildTrustedDomainPanel(content) {
+    const panel = document.createElement('div');
+    panel.className = 'jm-panel';
+    panel.dataset.panel = 'trusted-domains';
+
+    const list = document.createElement('div');
+    list.className = 'jm-folder-list';
+    list.dataset.role = 'trusted-domain-list';
+
+    const creator = document.createElement('div');
+    creator.className = 'jm-folder-create';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = '输入域名或完整 URL（如 example.com）';
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.textContent = '添加信任域名';
+    addBtn.addEventListener('click', () => {
+      const value = input.value.trim();
+      if (!value) {
+        notify('请输入要添加的域名。');
+        return;
+      }
+      const result = addApprovedDomainByInput(value);
+      if (!result.ok) {
+        if (result.reason === 'exists') {
+          notify('该域名已在信任列表中。');
+        } else {
+          notify('域名格式无效，请检查后重试。');
+        }
+        return;
+      }
+      input.value = '';
+      refreshTrustedDomainList();
+      notify(`已添加信任域名：${result.origin}`);
+    });
+    creator.append(input, addBtn);
+
+    panel.append(list, creator);
+    content.appendChild(panel);
+  }
+
   function buildExportPanel(content) {
     const panel = document.createElement('div');
     panel.className = 'jm-panel';
@@ -667,10 +952,23 @@
 
     const favoriteRow = document.createElement('div');
     favoriteRow.className = 'jm-form-row';
-    favoriteRow.innerHTML = `
-      <label>一键收藏间隔（ms）<input type="number" min="500" value="${settings.favoriteIntervalMs}"></label>
-      <label>fid <input type="text" value="${settings.favoriteFid}"></label>
-    `;
+    const intervalLabel = document.createElement('label');
+    intervalLabel.textContent = '一键收藏间隔（ms）';
+    const intervalInput = document.createElement('input');
+    intervalInput.type = 'number';
+    intervalInput.min = '500';
+    intervalInput.value = String(settings.favoriteIntervalMs);
+    intervalInput.dataset.field = 'favorite-interval';
+    intervalLabel.appendChild(intervalInput);
+    const fidLabel = document.createElement('label');
+    fidLabel.textContent = 'fid';
+    const fidInput = document.createElement('input');
+    fidInput.type = 'text';
+    fidInput.value = settings.favoriteFid;
+    fidInput.dataset.field = 'favorite-fid';
+    fidLabel.appendChild(fidInput);
+    favoriteRow.append(intervalLabel, fidLabel);
+
     const syncRow = document.createElement('div');
     syncRow.className = 'jm-form-row';
     syncRow.innerHTML = `
@@ -678,21 +976,77 @@
       <label><input type="checkbox" data-sync-delete ${settings.autoSyncFavoriteDelete ? 'checked' : ''}> 自动同步收藏删除</label>
     `;
 
-    const saveBtn = document.createElement('button');
-    saveBtn.type = 'button';
-    saveBtn.textContent = '保存设置';
-    saveBtn.addEventListener('click', () => {
-      const intervalInput = favoriteRow.querySelector('input[type="number"]');
-      const fidInput = favoriteRow.querySelector('input[type="text"]');
-      const syncAdd = syncRow.querySelector('input[data-sync-add]').checked;
-      const syncDelete = syncRow.querySelector('input[data-sync-delete]').checked;
+    const signAddressRow = document.createElement('div');
+    signAddressRow.className = 'jm-form-row';
+    const signAddressLabel = document.createElement('label');
+    signAddressLabel.textContent = '签到地址 ';
+    const signAddressInput = document.createElement('input');
+    signAddressInput.type = 'text';
+    signAddressInput.dataset.signAddress = '1';
+    signAddressInput.value = settings.dailySignAddress || '';
+    signAddressInput.placeholder = 'example.com 或 https://example.com';
+    signAddressLabel.appendChild(signAddressInput);
+    signAddressRow.appendChild(signAddressLabel);
+
+    const signParamsRow = document.createElement('div');
+    signParamsRow.className = 'jm-form-row';
+    const signDailyIdLabel = document.createElement('label');
+    signDailyIdLabel.textContent = 'daily_id ';
+    const signDailyIdInput = document.createElement('input');
+    signDailyIdInput.type = 'text';
+    signDailyIdInput.dataset.signDailyId = '1';
+    signDailyIdInput.value = settings.dailySignDailyId || '';
+    signDailyIdLabel.appendChild(signDailyIdInput);
+    const signOldStepLabel = document.createElement('label');
+    signOldStepLabel.textContent = 'oldStep ';
+    const signOldStepInput = document.createElement('input');
+    signOldStepInput.type = 'text';
+    signOldStepInput.dataset.signOldStep = '1';
+    signOldStepInput.value = settings.dailySignOldStep || '';
+    signOldStepLabel.appendChild(signOldStepInput);
+    signParamsRow.append(signDailyIdLabel, signOldStepLabel);
+
+    const signOptionsRow = document.createElement('div');
+    signOptionsRow.className = 'jm-form-row';
+    signOptionsRow.innerHTML = `
+      <label><input type="checkbox" data-auto-daily-sign ${settings.autoDailySignEnabled ? 'checked' : ''}> 启用自动签到（每天仅一次）</label>
+      <label><input type="checkbox" data-daily-sign-debug ${settings.dailySignDebug ? 'checked' : ''}> 启用签到调试日志（控制台）</label>
+    `;
+
+    const signDebugRow = document.createElement('div');
+    signDebugRow.className = 'jm-form-row';
+    const signDebugBtn = document.createElement('button');
+    signDebugBtn.type = 'button';
+    signDebugBtn.textContent = '签到调试（立即触发）';
+    signDebugBtn.title = '会先保存当前设置，再立即发起一次签到请求';
+    signDebugRow.appendChild(signDebugBtn);
+
+    const collectAndSaveSettings = () => {
+      const normalizedSignOrigin = normalizeSignOrigin(signAddressInput.value);
       setSettings({
         headerTitle: headerInput.value.trim() || DEFAULT_SETTINGS.headerTitle,
         favoriteIntervalMs: Math.max(500, Number(intervalInput.value) || DEFAULT_SETTINGS.favoriteIntervalMs),
         favoriteFid: fidInput.value.trim() || DEFAULT_SETTINGS.favoriteFid,
-        autoSyncFavoriteAdd: syncAdd,
-        autoSyncFavoriteDelete: syncDelete,
+        autoSyncFavoriteAdd: syncRow.querySelector('input[data-sync-add]').checked,
+        autoSyncFavoriteDelete: syncRow.querySelector('input[data-sync-delete]').checked,
+        dailySignAddress: normalizedSignOrigin,
+        dailySignDailyId: String(signDailyIdInput.value || '').trim(),
+        dailySignOldStep: String(signOldStepInput.value || '').trim(),
+        autoDailySignEnabled: signOptionsRow.querySelector('input[data-auto-daily-sign]').checked,
+        dailySignDebug: signOptionsRow.querySelector('input[data-daily-sign-debug]').checked,
       });
+      return normalizedSignOrigin;
+    };
+
+    const saveBtn = document.createElement('button');
+    saveBtn.type = 'button';
+    saveBtn.textContent = '保存设置';
+    saveBtn.addEventListener('click', () => {
+      const normalizedSignOrigin = collectAndSaveSettings();
+      const rawSignAddress = signAddressInput.value.trim();
+      if (rawSignAddress && !normalizedSignOrigin) {
+        notify('签到地址格式无效，已清空签到地址。');
+      }
       notify('设置已保存。');
       const header = document.querySelector('.jm-title');
       if (header) {
@@ -700,7 +1054,21 @@
       }
     });
 
-    panel.append(headerRow, favoriteRow, syncRow, saveBtn);
+    signDebugBtn.addEventListener('click', () => {
+      collectAndSaveSettings();
+      triggerDailySign({ manual: true });
+    });
+
+    panel.append(
+      headerRow,
+      favoriteRow,
+      syncRow,
+      signAddressRow,
+      signParamsRow,
+      signOptionsRow,
+      signDebugRow,
+      saveBtn
+    );
     content.appendChild(panel);
   }
 
@@ -738,6 +1106,53 @@
         }
       });
       actions.append(switchBtn, deleteBtn);
+
+      card.append(info, actions);
+      list.appendChild(card);
+    });
+  }
+
+  function refreshTrustedDomainList() {
+    const list = document.querySelector('[data-role="trusted-domain-list"]');
+    if (!list) {
+      return;
+    }
+    list.innerHTML = '';
+    const domains = [...getApprovedDomains()].sort((left, right) => left.localeCompare(right));
+    if (!domains.length) {
+      list.innerHTML = '<div class="jm-empty">当前没有信任域名。</div>';
+      return;
+    }
+
+    domains.forEach((item) => {
+      const card = document.createElement('div');
+      card.className = 'jm-folder-card';
+      if (item === domain) {
+        card.classList.add('active');
+      }
+
+      const info = document.createElement('div');
+      info.className = 'jm-folder-info';
+      info.innerHTML = `<strong>${item}</strong><span>${item === domain ? '当前站点' : '已信任域名'}</span>`;
+
+      const actions = document.createElement('div');
+      actions.className = 'jm-folder-actions';
+      const deleteBtn = document.createElement('button');
+      deleteBtn.type = 'button';
+      deleteBtn.textContent = '删除';
+      deleteBtn.addEventListener('click', () => {
+        const isCurrent = item === domain;
+        const confirmText = isCurrent
+          ? `确认删除当前域名「${item}」？删除后请刷新页面，脚本将停止。`
+          : `确认删除信任域名「${item}」？`;
+        if (!window.confirm(confirmText)) {
+          return;
+        }
+        removeApprovedDomain(item);
+        refreshTrustedDomainList();
+        notify(`已删除信任域名：${item}`);
+      });
+      actions.append(deleteBtn);
 
       card.append(info, actions);
       list.appendChild(card);
@@ -1258,29 +1673,68 @@
 
     document.body.appendChild(container);
     refreshFolderList();
+    refreshTrustedDomainList();
     refreshGrid();
   }
 
+  function addToastStyles() {
+    GM_addStyle(`
+      .jm-notify-toast {
+        position: fixed;
+        right: 20px;
+        bottom: 20px;
+        top: auto;
+        left: auto;
+        padding: 10px 14px;
+        background: #2d2d2d;
+        color: #fff;
+        border-radius: 6px;
+        opacity: 0;
+        transform: translateY(10px);
+        transition: all 0.2s ease;
+        z-index: 99999;
+        pointer-events: none;
+      }
+      .jm-notify-toast.top-right {
+        top: 20px;
+        bottom: auto;
+      }
+      .jm-notify-toast.show {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    `);
+  }
+
   function registerMenus() {
+    GM_registerMenuCommand('立即触发签到(忽略每日限制)', () => {
+      triggerDailySign({ manual: true });
+    });
+    GM_registerMenuCommand('查看自动签到状态', () => {
+      showDailySignStatus();
+    });
+
     GM_registerMenuCommand('认可当前域名', () => {
-      const domains = getApprovedDomains();
-      if (!domains.includes(domain)) {
-        setApprovedDomains([...domains, domain]);
+      const result = addApprovedDomainByInput(domain);
+      if (result.ok) {
         notify('已认可当前域名，请刷新页面生效。');
         window.alert('已认可当前域名，请刷新页面生效。');
+        refreshTrustedDomainList();
       } else {
         notify('当前域名已被认可。');
       }
     });
     GM_registerMenuCommand('撤销当前域名认可', () => {
-      const domains = getApprovedDomains().filter((item) => item !== domain);
-      setApprovedDomains(domains);
+      removeApprovedDomain(domain);
+      refreshTrustedDomainList();
       notify('已撤销认可，请刷新页面停止脚本。');
     });
   }
 
   function init() {
+    addToastStyles();
     registerMenus();
+    triggerDailySign();
 
     if (!isDomainApproved()) {
       return;
@@ -1543,7 +1997,7 @@
         color: #aaa;
         font-size: 14px;
       }
-      .jm-toast {
+      .jm-notify-toast {
         position: fixed;
         right: 20px;
         bottom: 20px;
@@ -1556,7 +2010,7 @@
         transition: all 0.2s ease;
         z-index: 99999;
       }
-      .jm-toast.show {
+      .jm-notify-toast.show {
         opacity: 1;
         transform: translateY(0);
       }
