@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JMComic 收藏夹管理器
 // @namespace    https://example.com/
-// @version      0.1.0
+// @version      0.2.0
 // @description  收藏夹 ID 采集、分页浏览、导入导出与一键收藏
 // @match        https://*/*
 // @grant        GM_setValue
