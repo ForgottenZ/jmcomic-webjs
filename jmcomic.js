@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JMComic 收藏夹管理器
 // @namespace    https://example.com/
-// @version      0.3.1
+// @version      0.4.0
 // @description  收藏夹 ID 采集、分页浏览、导入导出与一键收藏
 // @match        https://*/*
 // @grant        GM_setValue
@@ -10,6 +10,7 @@
 // @grant        GM_addStyle
 // @grant        GM_xmlhttpRequest
 // @grant        GM_download
+// @grant        GM_openInTab
 // @connect      *
 // ==/UserScript==
 
@@ -23,6 +24,9 @@
     captureState: 'captureState',
     settings: 'settings',
     dailySignRecord: 'dailySignRecord',
+    dailySignWorkerTask: 'dailySignWorkerTask',
+    dailySignDebugLog: 'dailySignDebugLog',
+    uiMemory: 'uiMemory',
   };
 
   const DEFAULT_SETTINGS = {
@@ -33,11 +37,21 @@
     thumbHeight: 227,
     autoSyncFavoriteAdd: true,
     autoSyncFavoriteDelete: true,
+    takeoverNativeFavorite: false,
+    rememberUiState: true,
     dailySignAddress: '',
+    dailySignUsername: '',
+    dailySignPassword: '',
     dailySignDailyId: '',
     dailySignOldStep: '',
     autoDailySignEnabled: true,
+    dailySignMode: 'tab',
+    dailySignTabActive: false,
+    dailySignWaitOfCloudflareSec: 10,
     dailySignDebug: false,
+    dailySignCamouflageMode: 'off',
+    dailySignCamouflageTitle: '',
+    dailySignCamouflageIcon: '',
   };
 
   const state = {
@@ -52,9 +66,46 @@
     isFullscreen: false,
   };
 
+  const DEFAULT_UI_MEMORY = {
+    windowVisible: true,
+    sortField: 'addedAt',
+    sortAsc: true,
+  };
+
   const ENCRYPTED_EXPORT_MARKER = 'VGhpcyBqYXZhc2NyaXB0IGlzIG1hZGUgYnkgTHVvYm8gd2l0aCBBSS4gVGtzIGZvciB1c2luZyBteSB3b3JrIQ==';
 
   const domain = window.location.origin;
+  const DAILY_SIGN_WORKER_FLAG = 'jm_daily_sign_worker';
+  const DAILY_SIGN_WORKER_TOKEN = 'jm_daily_sign_token';
+  const DAILY_SIGN_CAMOUFLAGE_ICON_ATTR = 'data-jm-daily-sign-camouflage-icon';
+  const INVISIBLE_TARGET_SELECTOR = 'img, picture, source[src], source[srcset], svg image';
+  const FAVORITE_ALBUM_OVERLOADED_RESPONSE = {
+    status: 1,
+    msg: `
+<div class="alert alert-dismissable alert-success m-b-15 m-t-0">
+    <button type="button" class="close" data-dismiss="alert">
+        ×
+        </button>
+            漫画添加到您最喜爱的清单!(Overloaded)</div>`,
+  };
+
+  const dailySignCamouflageState = {
+    captured: false,
+    applied: false,
+    originalTitle: '',
+    originalIcons: [],
+  };
+
+  const invisibleState = {
+    enabled: false,
+    observer: null,
+  };
+
+  const favoriteTakeoverState = {
+    mounted: false,
+    host: null,
+    originalRow: null,
+  };
 
   function getApprovedDomains() {
     return GM_getValue(STORAGE_KEYS.approvedDomains, []);
@@ -93,6 +144,81 @@
   function setSettings(partial) {
     const current = getSettings();
     GM_setValue(STORAGE_KEYS.settings, { ...current, ...partial });
+  }
+
+  function getUiMemory() {
+    const raw = GM_getValue(STORAGE_KEYS.uiMemory, null);
+    if (!raw || typeof raw !== 'object') {
+      return { ...DEFAULT_UI_MEMORY };
+    }
+    return { ...DEFAULT_UI_MEMORY, ...raw };
+  }
+
+  function setUiMemory(partial) {
+    const current = getUiMemory();
+    GM_setValue(STORAGE_KEYS.uiMemory, { ...current, ...partial });
+  }
+
+  function clearUiMemory() {
+    GM_setValue(STORAGE_KEYS.uiMemory, null);
+  }
+
+  function isUiMemoryEnabled() {
+    return Boolean(getSettings().rememberUiState);
+  }
+
+  function persistUiMemory(partial) {
+    if (!isUiMemoryEnabled()) {
+      return;
+    }
+    setUiMemory(partial);
+  }
+
+  function applyUiMemoryToState() {
+    if (!isUiMemoryEnabled()) {
+      return;
+    }
+    const memory = getUiMemory();
+    if (memory.sortField === 'id' || memory.sortField === 'addedAt') {
+      state.sortField = memory.sortField;
+    }
+    if (typeof memory.sortAsc === 'boolean') {
+      state.sortAsc = memory.sortAsc;
+    }
+  }
+
+  function shouldShowMainWindowOnInit() {
+    if (!isUiMemoryEnabled()) {
+      return true;
+    }
+    return getUiMemory().windowVisible !== false;
+  }
+
+  function getMainContainer() {
+    return document.querySelector('.jm-container[data-jm-main-window="1"]');
+  }
+
+  function isMainWindowVisible() {
+    return Boolean(getMainContainer());
+  }
+
+  function setMainWindowVisible(visible) {
+    const container = getMainContainer();
+    if (visible) {
+      if (isFavoriteTakeoverActive() && isTakeoverNativeFavoriteEnabled()) {
+        notify('已启用“接管原有的收藏功能”，请在页面内面板操作。');
+        return;
+      }
+      if (!container) {
+        mountUI();
+      }
+      persistUiMemory({ windowVisible: true });
+      return;
+    }
+    if (container) {
+      container.remove();
+    }
+    persistUiMemory({ windowVisible: false });
   }
 
   function getFolders() {
@@ -164,6 +290,102 @@
     return `${y}-${m}-${d}`;
   }
 
+  function clearTodayDailySignRecordForDebug() {
+    const today = getTodayKey();
+    const record = getDailySignRecord();
+    const needClear = record.lastAttemptDate === today || record.lastSuccessDate === today;
+    if (!needClear) {
+      return {
+        changed: false,
+        today,
+      };
+    }
+
+    setDailySignRecord({
+      lastAttemptDate: '',
+      lastSuccessDate: record.lastSuccessDate === today ? '' : record.lastSuccessDate || '',
+      lastStatus: 'debug_cleared_today',
+    });
+    return {
+      changed: true,
+      today,
+    };
+  }
+
+  function removeImagesFromNode(rootNode) {
+    if (!rootNode) {
+      return 0;
+    }
+    const targets = [];
+    if (rootNode.nodeType === 1) {
+      const element = rootNode;
+      if (typeof element.matches === 'function' && element.matches(INVISIBLE_TARGET_SELECTOR)) {
+        targets.push(element);
+      }
+      if (typeof element.querySelectorAll === 'function') {
+        targets.push(...element.querySelectorAll(INVISIBLE_TARGET_SELECTOR));
+      }
+    } else if (rootNode.nodeType === 9 && typeof rootNode.querySelectorAll === 'function') {
+      targets.push(...rootNode.querySelectorAll(INVISIBLE_TARGET_SELECTOR));
+    }
+    const uniqueTargets = Array.from(new Set(targets));
+    uniqueTargets.forEach((node) => node.remove());
+    return uniqueTargets.length;
+  }
+
+  function setInvisibleEnabled(enabled) {
+    const nextEnabled = Boolean(enabled);
+    if (nextEnabled === invisibleState.enabled) {
+      return {
+        changed: false,
+        enabled: invisibleState.enabled,
+        removedImages: 0,
+      };
+    }
+    invisibleState.enabled = nextEnabled;
+
+    if (!nextEnabled) {
+      if (invisibleState.observer) {
+        invisibleState.observer.disconnect();
+        invisibleState.observer = null;
+      }
+      return {
+        changed: true,
+        enabled: false,
+        removedImages: 0,
+      };
+    }
+
+    const removedImages = removeImagesFromNode(document);
+    if (invisibleState.observer) {
+      invisibleState.observer.disconnect();
+      invisibleState.observer = null;
+    }
+    const observeTarget = document.documentElement || document.body;
+    if (observeTarget) {
+      invisibleState.observer = new MutationObserver((mutations) => {
+        if (!invisibleState.enabled) {
+          return;
+        }
+        mutations.forEach((mutation) => {
+          mutation.addedNodes.forEach((node) => {
+            removeImagesFromNode(node);
+          });
+        });
+      });
+      invisibleState.observer.observe(observeTarget, {
+        childList: true,
+        subtree: true,
+      });
+    }
+
+    return {
+      changed: true,
+      enabled: true,
+      removedImages,
+    };
+  }
+
   function normalizeSignOrigin(rawAddress) {
     const raw = String(rawAddress || '').trim();
     if (!raw) {
@@ -178,10 +400,341 @@
     }
   }
 
+  function isDailySignWorkerUrl(url = window.location.href) {
+    try {
+      const pageUrl = new URL(url, window.location.href);
+      return (
+        pageUrl.searchParams.has(DAILY_SIGN_WORKER_FLAG) ||
+        pageUrl.searchParams.has(DAILY_SIGN_WORKER_TOKEN)
+      );
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function getDailySignCamouflageMode(settings) {
+    const mode = String(settings.dailySignCamouflageMode || '').toLowerCase();
+    if (mode === 'sign' || mode === 'always') {
+      return mode;
+    }
+    return 'off';
+  }
+
+  function isDailySignAddressPage(settings, url = window.location.href) {
+    const signOrigin = normalizeSignOrigin(settings?.dailySignAddress);
+    if (!signOrigin) {
+      return false;
+    }
+    try {
+      const pageUrl = new URL(url, window.location.href);
+      return pageUrl.origin === signOrigin;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function shouldApplyDailySignCamouflage(settings) {
+    if (!isDailySignAddressPage(settings)) {
+      return false;
+    }
+
+    const mode = getDailySignCamouflageMode(settings);
+    if (mode === 'always') {
+      return true;
+    }
+    if (mode === 'sign') {
+      return isDailySignWorkerUrl();
+    }
+    return false;
+  }
+
+  function captureOriginalPageLookForCamouflage() {
+    if (dailySignCamouflageState.captured) {
+      return;
+    }
+    dailySignCamouflageState.captured = true;
+    dailySignCamouflageState.originalTitle = document.title || '';
+    dailySignCamouflageState.originalIcons = Array.from(
+      document.querySelectorAll('link[rel*="icon"]')
+    ).map((link) => link.cloneNode(true));
+  }
+
+  function restoreOriginalPageLookFromCamouflage() {
+    if (!dailySignCamouflageState.captured || !dailySignCamouflageState.applied) {
+      return;
+    }
+
+    document.title = dailySignCamouflageState.originalTitle || document.title;
+    const head = document.head || document.documentElement;
+    if (head) {
+      head.querySelectorAll('link[rel*="icon"]').forEach((link) => link.remove());
+      dailySignCamouflageState.originalIcons.forEach((link) => {
+        head.appendChild(link.cloneNode(true));
+      });
+    }
+    dailySignCamouflageState.applied = false;
+  }
+
+  function replacePageIcon(iconUrl) {
+    const head = document.head || document.documentElement;
+    if (!head) {
+      return;
+    }
+    head.querySelectorAll('link[rel*="icon"]').forEach((link) => link.remove());
+    const icon = document.createElement('link');
+    icon.rel = 'icon';
+    icon.type = 'image/x-icon';
+    icon.href = iconUrl;
+    icon.setAttribute(DAILY_SIGN_CAMOUFLAGE_ICON_ATTR, '1');
+    head.appendChild(icon);
+  }
+
+  function applyDailySignCamouflageIfNeeded(settings = getSettings()) {
+    if (!shouldApplyDailySignCamouflage(settings)) {
+      restoreOriginalPageLookFromCamouflage();
+      return;
+    }
+
+    if (dailySignCamouflageState.applied) {
+      restoreOriginalPageLookFromCamouflage();
+    }
+    captureOriginalPageLookForCamouflage();
+
+    const camouflageTitle = String(settings.dailySignCamouflageTitle || '').trim();
+    if (camouflageTitle) {
+      document.title = camouflageTitle;
+    }
+
+    const camouflageIcon = String(settings.dailySignCamouflageIcon || '').trim();
+    if (camouflageIcon) {
+      replacePageIcon(camouflageIcon);
+    }
+
+    dailySignCamouflageState.applied = true;
+  }
+
+  function scheduleDailySignWorkerTabClose({
+    delayMs = 0,
+    intervalMs = 1000,
+    maxAttempts = 12,
+    debugEnabled = false,
+    debugSessionId = null,
+    reason = 'completed',
+  } = {}) {
+    const startCloseLoop = () => {
+      if (!isDailySignWorkerUrl()) {
+        return;
+      }
+
+      let attempts = 0;
+      window.close();
+      const timer = setInterval(() => {
+        if (!isDailySignWorkerUrl()) {
+          clearInterval(timer);
+          return;
+        }
+        attempts += 1;
+        window.close();
+        if (attempts >= maxAttempts) {
+          clearInterval(timer);
+        }
+      }, Math.max(300, Number(intervalMs) || 1000));
+
+      logDailySignDebug(
+        debugEnabled,
+        '签到工作页触发自动关闭重试',
+        {
+          reason,
+          delayMs,
+          intervalMs,
+          maxAttempts,
+          page: window.location.href,
+        },
+        debugSessionId
+      );
+    };
+
+    if (delayMs > 0) {
+      setTimeout(startCloseLoop, delayMs);
+      return;
+    }
+    startCloseLoop();
+  }
+
   function buildDailySignPayload(config) {
     return `daily_id=${encodeURIComponent(config.dailySignDailyId)}&oldStep=${encodeURIComponent(
       config.dailySignOldStep
     )}`;
+  }
+
+  function buildDailyLoginPayload(config) {
+    return `username=${encodeURIComponent(config.dailySignUsername)}&password=${encodeURIComponent(
+      config.dailySignPassword
+    )}&id_remember=on&submit_login=1`;
+  }
+
+  function setDailySignWorkerTask(task) {
+    GM_setValue(STORAGE_KEYS.dailySignWorkerTask, task);
+  }
+
+  function getDailySignWorkerTask() {
+    const task = GM_getValue(STORAGE_KEYS.dailySignWorkerTask, null);
+    if (!task || typeof task !== 'object') {
+      return null;
+    }
+    return task;
+  }
+
+  function clearDailySignWorkerTask() {
+    GM_setValue(STORAGE_KEYS.dailySignWorkerTask, null);
+  }
+
+  function getDailySignMode(settings) {
+    return settings.dailySignMode === 'xhr' ? 'xhr' : 'tab';
+  }
+
+  function getWaitOfCloudflareSec(settings) {
+    const value = Number(settings.dailySignWaitOfCloudflareSec);
+    if (!Number.isFinite(value)) {
+      return DEFAULT_SETTINGS.dailySignWaitOfCloudflareSec;
+    }
+    return Math.max(0, value);
+  }
+
+  function getDailySignDebugLog() {
+    const log = GM_getValue(STORAGE_KEYS.dailySignDebugLog, null);
+    if (!log || typeof log !== 'object') {
+      return null;
+    }
+    return log;
+  }
+
+  function setDailySignDebugLog(log) {
+    GM_setValue(STORAGE_KEYS.dailySignDebugLog, log);
+  }
+
+  function clearDailySignDebugLog() {
+    GM_setValue(STORAGE_KEYS.dailySignDebugLog, null);
+  }
+
+  function normalizeDebugPayload(value, parentKey = '') {
+    const key = String(parentKey || '').toLowerCase();
+    if (key.includes('password')) {
+      return '******';
+    }
+    if (typeof value === 'string') {
+      return value;
+    }
+    if (value === null || typeof value !== 'object') {
+      return value;
+    }
+    if (Array.isArray(value)) {
+      return value.map((item) => normalizeDebugPayload(item, parentKey));
+    }
+    const next = {};
+    Object.keys(value).forEach((field) => {
+      next[field] = normalizeDebugPayload(value[field], field);
+    });
+    return next;
+  }
+
+  function startDailySignDebugSession(enabled, meta) {
+    if (!enabled) {
+      return null;
+    }
+    const sessionId = `${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+    setDailySignDebugLog({
+      sessionId,
+      startedAt: new Date().toISOString(),
+      finishedAt: '',
+      status: 'running',
+      meta: normalizeDebugPayload(meta || {}),
+      entries: [],
+      summary: {},
+    });
+    return sessionId;
+  }
+
+  function appendDailySignDebugEntry(enabled, debugSessionId, title, payload) {
+    if (!enabled || !debugSessionId) {
+      return;
+    }
+    const current = getDailySignDebugLog();
+    if (!current || current.sessionId !== debugSessionId) {
+      return;
+    }
+    const entries = Array.isArray(current.entries) ? [...current.entries] : [];
+    entries.push({
+      at: new Date().toISOString(),
+      title,
+      payload: normalizeDebugPayload(payload),
+    });
+    setDailySignDebugLog({
+      ...current,
+      entries,
+    });
+  }
+
+  function finishDailySignDebugSession(enabled, debugSessionId, status, summary = {}) {
+    if (!enabled || !debugSessionId) {
+      return;
+    }
+    const current = getDailySignDebugLog();
+    if (!current || current.sessionId !== debugSessionId) {
+      return;
+    }
+    setDailySignDebugLog({
+      ...current,
+      finishedAt: new Date().toISOString(),
+      status: status || current.status || 'finished',
+      summary: normalizeDebugPayload(summary),
+    });
+  }
+
+  function buildDailySignDebugLogText() {
+    const log = getDailySignDebugLog();
+    if (!log) {
+      return '暂无签到调试日志。';
+    }
+    const lines = [];
+    lines.push(`sessionId: ${log.sessionId || ''}`);
+    lines.push(`status: ${log.status || ''}`);
+    lines.push(`startedAt: ${log.startedAt || ''}`);
+    lines.push(`finishedAt: ${log.finishedAt || ''}`);
+    lines.push('');
+    lines.push('meta:');
+    lines.push(JSON.stringify(log.meta || {}, null, 2));
+    lines.push('');
+    lines.push('entries:');
+    const entries = Array.isArray(log.entries) ? log.entries : [];
+    if (!entries.length) {
+      lines.push('(empty)');
+    } else {
+      entries.forEach((entry, index) => {
+        lines.push(`[${index + 1}] ${entry.at || ''} ${entry.title || ''}`);
+        lines.push(JSON.stringify(entry.payload ?? {}, null, 2));
+        lines.push('');
+      });
+    }
+    lines.push('summary:');
+    lines.push(JSON.stringify(log.summary || {}, null, 2));
+    return lines.join('\n');
+  }
+
+  function logDailySignDebug(enabled, title, payload, debugSessionId = null) {
+    if (!enabled) {
+      return;
+    }
+    const normalized = normalizeDebugPayload(payload);
+    console.log(`[JM签到调试] ${title}`, normalized);
+    appendDailySignDebugEntry(enabled, debugSessionId, title, normalized);
+  }
+
+  function createDailySignWorkerUrl(signOrigin, taskToken) {
+    const workerUrl = new URL(`${signOrigin}/`);
+    workerUrl.searchParams.set(DAILY_SIGN_WORKER_FLAG, '1');
+    workerUrl.searchParams.set(DAILY_SIGN_WORKER_TOKEN, taskToken);
+    return workerUrl.toString();
   }
 
   function ensureDailySignConfig(settings, manual) {
@@ -189,6 +742,15 @@
     if (!signOrigin) {
       if (manual) {
         notify('签到地址未设置或格式错误。');
+      }
+      return null;
+    }
+
+    const username = String(settings.dailySignUsername || '').trim();
+    const password = String(settings.dailySignPassword || '').trim();
+    if (!username || !password) {
+      if (manual) {
+        notify('请先设置登录账号和密码。');
       }
       return null;
     }
@@ -204,9 +766,304 @@
 
     return {
       signOrigin,
+      dailySignUsername: username,
+      dailySignPassword: password,
       dailySignDailyId: dailyId,
       dailySignOldStep: oldStep,
     };
+  }
+
+  function runDailySignViaXhr({ manual, config, today, record, debugEnabled, debugSessionId }) {
+    const loginUrl = `${config.signOrigin}/login`;
+    const loginPayload = buildDailyLoginPayload(config);
+    const url = `${config.signOrigin}/ajax/user_daily_sign`;
+    const payload = buildDailySignPayload(config);
+
+    logDailySignDebug(
+      debugEnabled,
+      '发送登录请求（GM_xmlhttpRequest）',
+      {
+      page: window.location.href,
+      manual,
+      url: loginUrl,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      },
+      data: {
+        username: config.dailySignUsername,
+        password: '******',
+        id_remember: 'on',
+        submit_login: '1',
+      },
+      today,
+      },
+      debugSessionId
+    );
+    notify(`已触发今日签到请求：${config.signOrigin}`, { position: 'top-right' });
+
+    GM_xmlhttpRequest({
+      method: 'POST',
+      url: loginUrl,
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      },
+      data: loginPayload,
+      timeout: 15000,
+      onload: (loginResponse) => {
+        const loginSuccess = loginResponse.status >= 200 && loginResponse.status < 300;
+        logDailySignDebug(
+          debugEnabled,
+          '登录响应（GM_xmlhttpRequest）',
+          {
+          success: loginSuccess,
+          status: loginResponse.status,
+          responseText: loginResponse.responseText,
+          finalUrl: loginUrl,
+          requestData: {
+            username: config.dailySignUsername,
+            password: '******',
+            id_remember: 'on',
+            submit_login: '1',
+          },
+          },
+          debugSessionId
+        );
+        if (!loginSuccess) {
+          setDailySignRecord({
+            lastAttemptDate: today,
+            lastSuccessDate: record.lastSuccessDate || '',
+            lastStatus: `login_http_${loginResponse.status}`,
+          });
+          finishDailySignDebugSession(debugEnabled, debugSessionId, `login_http_${loginResponse.status}`, {
+            step: 'login',
+            loginStatus: loginResponse.status,
+          });
+          if (manual) {
+            notify(`登录失败（HTTP ${loginResponse.status}）。`, { position: 'top-right' });
+          }
+          return;
+        }
+
+        logDailySignDebug(
+          debugEnabled,
+          '发送签到请求（GM_xmlhttpRequest）',
+          {
+          page: window.location.href,
+          manual,
+          url,
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          },
+          data: payload,
+          today,
+          },
+          debugSessionId
+        );
+
+        GM_xmlhttpRequest({
+          method: 'POST',
+          url,
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          },
+          data: payload,
+          timeout: 15000,
+          onload: (response) => {
+            const success = response.status >= 200 && response.status < 300;
+            setDailySignRecord({
+              lastAttemptDate: today,
+              lastSuccessDate: success ? today : record.lastSuccessDate || '',
+              lastStatus: success ? 'success' : `http_${response.status}`,
+            });
+            logDailySignDebug(
+              debugEnabled,
+              '签到响应（GM_xmlhttpRequest）',
+              {
+              success,
+              status: response.status,
+              responseText: response.responseText,
+              finalUrl: url,
+              requestData: payload,
+              },
+              debugSessionId
+            );
+            finishDailySignDebugSession(debugEnabled, debugSessionId, success ? 'success' : `http_${response.status}`, {
+              step: 'sign',
+              signStatus: response.status,
+              success,
+            });
+            if (manual) {
+              notify(success ? '签到请求已发送。' : `签到失败（HTTP ${response.status}）。`, { position: 'top-right' });
+            }
+          },
+          onerror: (error) => {
+            setDailySignRecord({
+              lastAttemptDate: today,
+              lastStatus: 'network_error',
+            });
+            logDailySignDebug(
+              debugEnabled,
+              '签到请求网络错误（GM_xmlhttpRequest）',
+              {
+              error,
+              finalUrl: url,
+              requestData: payload,
+              },
+              debugSessionId
+            );
+            finishDailySignDebugSession(debugEnabled, debugSessionId, 'network_error', {
+              step: 'sign',
+            });
+            if (manual) {
+              notify('签到请求失败（网络错误）。', { position: 'top-right' });
+            }
+          },
+          ontimeout: () => {
+            setDailySignRecord({
+              lastAttemptDate: today,
+              lastStatus: 'timeout',
+            });
+            logDailySignDebug(
+              debugEnabled,
+              '签到请求超时（GM_xmlhttpRequest）',
+              {
+              finalUrl: url,
+              requestData: payload,
+              },
+              debugSessionId
+            );
+            finishDailySignDebugSession(debugEnabled, debugSessionId, 'timeout', {
+              step: 'sign',
+            });
+            if (manual) {
+              notify('签到请求超时。', { position: 'top-right' });
+            }
+          },
+        });
+      },
+      onerror: (error) => {
+        setDailySignRecord({
+          lastAttemptDate: today,
+          lastStatus: 'login_network_error',
+        });
+        logDailySignDebug(
+          debugEnabled,
+          '登录请求网络错误（GM_xmlhttpRequest）',
+          {
+          error,
+          finalUrl: loginUrl,
+          requestData: {
+            username: config.dailySignUsername,
+            password: '******',
+            id_remember: 'on',
+            submit_login: '1',
+          },
+          },
+          debugSessionId
+        );
+        finishDailySignDebugSession(debugEnabled, debugSessionId, 'login_network_error', {
+          step: 'login',
+        });
+        if (manual) {
+          notify('登录请求失败（网络错误）。', { position: 'top-right' });
+        }
+      },
+      ontimeout: () => {
+        setDailySignRecord({
+          lastAttemptDate: today,
+          lastStatus: 'login_timeout',
+        });
+        logDailySignDebug(
+          debugEnabled,
+          '登录请求超时（GM_xmlhttpRequest）',
+          {
+          finalUrl: loginUrl,
+          requestData: {
+            username: config.dailySignUsername,
+            password: '******',
+            id_remember: 'on',
+            submit_login: '1',
+          },
+          },
+          debugSessionId
+        );
+        finishDailySignDebugSession(debugEnabled, debugSessionId, 'login_timeout', {
+          step: 'login',
+        });
+        if (manual) {
+          notify('登录请求超时。', { position: 'top-right' });
+        }
+      },
+    });
+  }
+
+  function runDailySignViaWorkerTab({ manual, config, today, debugEnabled, settings, debugSessionId }) {
+    const taskToken = `${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+    const waitOfCloudflareSec = getWaitOfCloudflareSec(settings);
+    setDailySignWorkerTask({
+      token: taskToken,
+      signOrigin: config.signOrigin,
+      dailySignUsername: config.dailySignUsername,
+      dailySignPassword: config.dailySignPassword,
+      dailySignDailyId: config.dailySignDailyId,
+      dailySignOldStep: config.dailySignOldStep,
+      waitOfCloudflareSec,
+      debugSessionId,
+      createdAt: Date.now(),
+    });
+    const workerUrl = createDailySignWorkerUrl(config.signOrigin, taskToken);
+    const active = Boolean(settings.dailySignTabActive);
+    notify(`已打开签到标签页：${active ? '前台' : '后台'} 模式`, { position: 'top-right' });
+    logDailySignDebug(
+      debugEnabled,
+      '打开签到标签页（GM_openInTab）',
+      {
+      page: window.location.href,
+      manual,
+      workerUrl,
+      active,
+      waitOfCloudflareSec,
+      },
+      debugSessionId
+    );
+
+    try {
+      GM_openInTab(workerUrl, {
+        active,
+        insert: true,
+        setParent: true,
+      });
+      setDailySignRecord({
+        lastAttemptDate: today,
+        lastStatus: 'opened_tab',
+      });
+      logDailySignDebug(
+        debugEnabled,
+        '签到标签页已打开，等待工作页执行',
+        {
+          workerUrl,
+          active,
+          waitOfCloudflareSec,
+        },
+        debugSessionId
+      );
+      if (manual) {
+        notify('签到标签页已启动，完成后会自动关闭。', { position: 'top-right' });
+      }
+    } catch (error) {
+      clearDailySignWorkerTask();
+      setDailySignRecord({
+        lastAttemptDate: today,
+        lastStatus: 'open_tab_failed',
+      });
+      logDailySignDebug(debugEnabled, '打开签到标签页失败（GM_openInTab）', { error, workerUrl }, debugSessionId);
+      finishDailySignDebugSession(debugEnabled, debugSessionId, 'open_tab_failed', {
+        step: 'open_tab',
+      });
+      notify('打开签到标签页失败，请检查油猴权限。', { position: 'top-right' });
+    }
   }
 
   function triggerDailySign(options = {}) {
@@ -217,37 +1074,34 @@
 
     const settings = getSettings();
     const debugEnabled = Boolean(settings.dailySignDebug);
+    const mode = getDailySignMode(settings);
     if (!manual && !settings.autoDailySignEnabled) {
-      if (debugEnabled) {
-        console.log('[JM签到调试] 已跳过自动签到：开关关闭', {
-          page: window.location.href,
-        });
-      }
+      logDailySignDebug(debugEnabled, '已跳过自动签到：开关关闭', {
+        page: window.location.href,
+      });
       return;
     }
 
     const config = ensureDailySignConfig(settings, manual);
     if (!config) {
-      if (debugEnabled) {
-        console.log('[JM签到调试] 已跳过签到：配置不完整', {
-          dailySignAddress: settings.dailySignAddress || '',
-          dailySignDailyId: settings.dailySignDailyId || '',
-          dailySignOldStep: settings.dailySignOldStep || '',
-        });
-      }
+      logDailySignDebug(debugEnabled, '已跳过签到：配置不完整', {
+        dailySignAddress: settings.dailySignAddress || '',
+        dailySignUsername: settings.dailySignUsername || '',
+        dailySignPassword: settings.dailySignPassword ? '******' : '',
+        dailySignDailyId: settings.dailySignDailyId || '',
+        dailySignOldStep: settings.dailySignOldStep || '',
+      });
       return;
     }
 
     const today = getTodayKey();
     const record = getDailySignRecord();
     if (!manual && record.lastAttemptDate === today) {
-      if (debugEnabled) {
-        console.log('[JM签到调试] 已跳过自动签到：今日已触发', {
-          today,
-          lastAttemptDate: record.lastAttemptDate,
-          lastStatus: record.lastStatus,
-        });
-      }
+      logDailySignDebug(debugEnabled, '已跳过自动签到：今日已触发', {
+        today,
+        lastAttemptDate: record.lastAttemptDate,
+        lastStatus: record.lastStatus,
+      });
       return;
     }
 
@@ -258,83 +1112,272 @@
       });
     }
 
-    const url = `${config.signOrigin}/ajax/user_daily_sign`;
-    const payload = buildDailySignPayload(config);
-    if (debugEnabled) {
-      console.log('[JM签到调试] 发送签到请求', {
-        page: window.location.href,
-        manual,
-        url,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-        },
-        data: payload,
-        today,
-      });
-    }
-    notify(`已触发今日签到请求：${config.signOrigin}`, { position: 'top-right' });
-
-    GM_xmlhttpRequest({
-      method: 'POST',
-      url,
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-      },
-      data: payload,
-      timeout: 15000,
-      onload: (response) => {
-        const success = response.status >= 200 && response.status < 300;
-        setDailySignRecord({
-          lastAttemptDate: today,
-          lastSuccessDate: success ? today : record.lastSuccessDate || '',
-          lastStatus: success ? 'success' : `http_${response.status}`,
-        });
-        if (debugEnabled) {
-          console.log('[JM签到调试] 签到响应', {
-            success,
-            status: response.status,
-            responseText: response.responseText,
-            finalUrl: url,
-            requestData: payload,
-          });
-        }
-        if (manual) {
-          notify(success ? '签到请求已发送。' : `签到失败（HTTP ${response.status}）。`, { position: 'top-right' });
-        }
-      },
-      onerror: (error) => {
-        setDailySignRecord({
-          lastAttemptDate: today,
-          lastStatus: 'network_error',
-        });
-        if (debugEnabled) {
-          console.log('[JM签到调试] 签到请求网络错误', {
-            error,
-            finalUrl: url,
-            requestData: payload,
-          });
-        }
-        if (manual) {
-          notify('签到请求失败（网络错误）。', { position: 'top-right' });
-        }
-      },
-      ontimeout: () => {
-        setDailySignRecord({
-          lastAttemptDate: today,
-          lastStatus: 'timeout',
-        });
-        if (debugEnabled) {
-          console.log('[JM签到调试] 签到请求超时', {
-            finalUrl: url,
-            requestData: payload,
-          });
-        }
-        if (manual) {
-          notify('签到请求超时。', { position: 'top-right' });
-        }
-      },
+    const debugSessionId = startDailySignDebugSession(debugEnabled, {
+      manual,
+      mode,
+      page: window.location.href,
+      signOrigin: config.signOrigin,
+      waitOfCloudflareSec: getWaitOfCloudflareSec(settings),
+      startedAt: new Date().toISOString(),
     });
+    logDailySignDebug(
+      debugEnabled,
+      '签到流程开始',
+      {
+        manual,
+        mode,
+        signOrigin: config.signOrigin,
+        waitOfCloudflareSec: getWaitOfCloudflareSec(settings),
+      },
+      debugSessionId
+    );
+
+    if (mode === 'tab') {
+      runDailySignViaWorkerTab({
+        manual,
+        config,
+        today,
+        debugEnabled,
+        settings,
+        debugSessionId,
+      });
+      return;
+    }
+
+    runDailySignViaXhr({
+      manual,
+      config,
+      today,
+      record,
+      debugEnabled,
+      debugSessionId,
+    });
+  }
+
+  function runDailySignWorkerIfNeeded() {
+    const pageUrl = new URL(window.location.href);
+    if (!pageUrl.searchParams.has(DAILY_SIGN_WORKER_FLAG) && !pageUrl.searchParams.has(DAILY_SIGN_WORKER_TOKEN)) {
+      return false;
+    }
+    if (window.top !== window.self) {
+      return true;
+    }
+
+    const settings = getSettings();
+    const debugEnabled = Boolean(settings.dailySignDebug);
+    const taskToken = pageUrl.searchParams.get(DAILY_SIGN_WORKER_TOKEN) || '';
+    const task = getDailySignWorkerTask();
+    const debugSessionId = task?.debugSessionId || null;
+    if (!taskToken || !task || task.token !== taskToken) {
+      logDailySignDebug(
+        debugEnabled,
+        '签到工作页任务缺失或 token 不匹配，直接关闭',
+        {
+          url: window.location.href,
+          taskToken,
+          taskExists: Boolean(task),
+        },
+        debugSessionId
+      );
+      finishDailySignDebugSession(debugEnabled, debugSessionId, 'worker_task_mismatch', {
+        taskToken,
+        taskExists: Boolean(task),
+      });
+      clearDailySignWorkerTask();
+      scheduleDailySignWorkerTabClose({
+        delayMs: 300,
+        intervalMs: 1000,
+        maxAttempts: 12,
+        debugEnabled,
+        debugSessionId,
+        reason: 'worker_task_mismatch',
+      });
+      return true;
+    }
+
+    const signOrigin = normalizeSignOrigin(task.signOrigin) || window.location.origin;
+    const loginUrl = `${signOrigin}/login`;
+    const loginPayload = buildDailyLoginPayload(task);
+    const url = `${signOrigin}/ajax/user_daily_sign`;
+    const waitOfCloudflareSec = Math.max(0, Number(task.waitOfCloudflareSec) || 0);
+    const payload = `daily_id=${encodeURIComponent(task.dailySignDailyId)}&oldStep=${encodeURIComponent(
+      task.dailySignOldStep
+    )}`;
+    const today = getTodayKey();
+    const record = getDailySignRecord();
+
+    const run = async () => {
+      let lastStatus = 'network_error';
+      let success = false;
+      let responseText = '';
+      const maxAttempts = 3;
+      let loginSuccess = false;
+
+      if (waitOfCloudflareSec > 0) {
+        logDailySignDebug(
+          debugEnabled,
+          '签到工作页等待 Cloudflare',
+          {
+            waitOfCloudflareSec,
+            url: window.location.href,
+          },
+          debugSessionId
+        );
+        await new Promise((resolve) => setTimeout(resolve, waitOfCloudflareSec * 1000));
+      }
+
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        try {
+          const loginResponse = await fetch(loginUrl, {
+            method: 'POST',
+            credentials: 'include',
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            },
+            body: loginPayload,
+          });
+          const loginResponseText = await loginResponse.text();
+          loginSuccess = loginResponse.status >= 200 && loginResponse.status < 300;
+          logDailySignDebug(
+            debugEnabled,
+            '签到工作页登录结果',
+            {
+              attempt,
+              maxAttempts,
+              success: loginSuccess,
+              status: loginResponse.status,
+              url: loginUrl,
+              requestData: {
+                username: task.dailySignUsername,
+                password: '******',
+                id_remember: 'on',
+                submit_login: '1',
+              },
+              responseText: loginResponseText,
+            },
+            debugSessionId
+          );
+          if (loginSuccess || loginResponse.status !== 403 || attempt >= maxAttempts) {
+            if (!loginSuccess) {
+              lastStatus = `login_http_${loginResponse.status}`;
+            }
+            break;
+          }
+        } catch (error) {
+          lastStatus = 'login_network_error';
+          logDailySignDebug(
+            debugEnabled,
+            '签到工作页登录异常',
+            {
+              attempt,
+              maxAttempts,
+              url: loginUrl,
+              requestData: {
+                username: task.dailySignUsername,
+                password: '******',
+                id_remember: 'on',
+                submit_login: '1',
+              },
+              error,
+            },
+            debugSessionId
+          );
+          if (attempt >= maxAttempts) {
+            break;
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 2500));
+      }
+
+      if (loginSuccess) {
+        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+          try {
+            const response = await fetch(url, {
+              method: 'POST',
+              credentials: 'include',
+              headers: {
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                'X-Requested-With': 'XMLHttpRequest',
+              },
+              body: payload,
+            });
+            responseText = await response.text();
+            success = response.status >= 200 && response.status < 300;
+            lastStatus = success ? 'success' : `http_${response.status}`;
+            logDailySignDebug(
+              debugEnabled,
+              '签到工作页请求结果',
+              {
+                attempt,
+                maxAttempts,
+                success,
+                status: response.status,
+                url,
+                requestData: payload,
+                responseText,
+              },
+              debugSessionId
+            );
+            if (success || response.status !== 403 || attempt >= maxAttempts) {
+              break;
+            }
+          } catch (error) {
+            lastStatus = 'network_error';
+            logDailySignDebug(
+              debugEnabled,
+              '签到工作页请求异常',
+              {
+                attempt,
+                maxAttempts,
+                url,
+                requestData: payload,
+                error,
+              },
+              debugSessionId
+            );
+            if (attempt >= maxAttempts) {
+              break;
+            }
+          }
+          await new Promise((resolve) => setTimeout(resolve, 2500));
+        }
+      }
+
+      setDailySignRecord({
+        lastAttemptDate: today,
+        lastSuccessDate: success ? today : record.lastSuccessDate || '',
+        lastStatus,
+      });
+      logDailySignDebug(
+        debugEnabled,
+        '签到工作页结束，准备关闭标签页',
+        {
+          success,
+          lastStatus,
+          loginUrl,
+          signUrl: url,
+          responseText,
+        },
+        debugSessionId
+      );
+      finishDailySignDebugSession(debugEnabled, debugSessionId, lastStatus, {
+        success,
+        loginUrl,
+        signUrl: url,
+      });
+      clearDailySignWorkerTask();
+      scheduleDailySignWorkerTabClose({
+        delayMs: 800,
+        intervalMs: 1000,
+        maxAttempts: 12,
+        debugEnabled,
+        debugSessionId,
+        reason: 'worker_finished',
+      });
+    };
+
+    run();
+    return true;
   }
 
   function showDailySignStatus() {
@@ -345,10 +1388,17 @@
     const lastDate = record.lastAttemptDate || '无';
     const status = record.lastStatus || 'idle';
     const debugText = settings.dailySignDebug ? '开启' : '关闭';
-    notify(`自动签到:${autoText} 调试:${debugText} 地址:${signOrigin} 最近:${lastDate} 状态:${status}`, {
-      position: 'top-right',
-      duration: 4200,
-    });
+    const modeText = getDailySignMode(settings) === 'tab' ? '标签页' : '直连';
+    const activeText = settings.dailySignTabActive ? '前台' : '后台';
+    const waitText = `${getWaitOfCloudflareSec(settings)}s`;
+    const modeDetail = modeText === '标签页' ? `(${activeText})` : '';
+    notify(
+      `自动签到:${autoText} 模式:${modeText}${modeDetail} WaitOfCloudflare:${waitText} 调试:${debugText} 地址:${signOrigin} 最近:${lastDate} 状态:${status}`,
+      {
+        position: 'top-right',
+        duration: 4200,
+      }
+    );
   }
 
   function generateId(prefix) {
@@ -613,7 +1663,7 @@
     close.type = 'button';
     close.textContent = '×';
     close.addEventListener('click', () => {
-      container.remove();
+      setMainWindowVisible(false);
     });
     actions.append(maximize, minimize, close);
     header.append(title, actions);
@@ -716,9 +1766,11 @@
       <option value="addedAt">按照添加时间顺序排序</option>
       <option value="id">按照 ID 大小排序</option>
     `;
+    sortSelect.value = state.sortField;
     sortSelect.addEventListener('change', () => {
       state.sortField = sortSelect.value;
       state.uiPage = 1;
+      persistUiMemory({ sortField: state.sortField });
       refreshGrid();
     });
 
@@ -731,6 +1783,7 @@
     sortOrderBtn.addEventListener('click', () => {
       state.sortAsc = !state.sortAsc;
       refreshSortText();
+      persistUiMemory({ sortAsc: state.sortAsc });
       refreshGrid();
     });
 
@@ -976,6 +2029,18 @@
       <label><input type="checkbox" data-sync-delete ${settings.autoSyncFavoriteDelete ? 'checked' : ''}> 自动同步收藏删除</label>
     `;
 
+    const uiMemoryRow = document.createElement('div');
+    uiMemoryRow.className = 'jm-form-row';
+    uiMemoryRow.innerHTML = `
+      <label><input type="checkbox" data-remember-ui-state ${settings.rememberUiState ? 'checked' : ''}> 记忆悬浮窗显示状态与排序顺序</label>
+    `;
+
+    const takeoverNativeFavoriteRow = document.createElement('div');
+    takeoverNativeFavoriteRow.className = 'jm-form-row';
+    takeoverNativeFavoriteRow.innerHTML = `
+      <label><input type="checkbox" data-takeover-native-favorite ${settings.takeoverNativeFavorite ? 'checked' : ''}> 接管原有的收藏功能</label>
+    `;
+
     const signAddressRow = document.createElement('div');
     signAddressRow.className = 'jm-form-row';
     const signAddressLabel = document.createElement('label');
@@ -987,6 +2052,24 @@
     signAddressInput.placeholder = 'example.com 或 https://example.com';
     signAddressLabel.appendChild(signAddressInput);
     signAddressRow.appendChild(signAddressLabel);
+
+    const signAuthRow = document.createElement('div');
+    signAuthRow.className = 'jm-form-row';
+    const signUsernameLabel = document.createElement('label');
+    signUsernameLabel.textContent = 'username ';
+    const signUsernameInput = document.createElement('input');
+    signUsernameInput.type = 'text';
+    signUsernameInput.dataset.signUsername = '1';
+    signUsernameInput.value = settings.dailySignUsername || '';
+    signUsernameLabel.appendChild(signUsernameInput);
+    const signPasswordLabel = document.createElement('label');
+    signPasswordLabel.textContent = 'password ';
+    const signPasswordInput = document.createElement('input');
+    signPasswordInput.type = 'password';
+    signPasswordInput.dataset.signPassword = '1';
+    signPasswordInput.value = settings.dailySignPassword || '';
+    signPasswordLabel.appendChild(signPasswordInput);
+    signAuthRow.append(signUsernameLabel, signPasswordLabel);
 
     const signParamsRow = document.createElement('div');
     signParamsRow.className = 'jm-form-row';
@@ -1006,12 +2089,74 @@
     signOldStepLabel.appendChild(signOldStepInput);
     signParamsRow.append(signDailyIdLabel, signOldStepLabel);
 
+    const signModeRow = document.createElement('div');
+    signModeRow.className = 'jm-form-row';
+    const signModeLabel = document.createElement('label');
+    signModeLabel.textContent = '签到触发方式 ';
+    const signModeSelect = document.createElement('select');
+    signModeSelect.dataset.signMode = '1';
+    signModeSelect.innerHTML = `
+      <option value="tab">标签页执行（推荐，规避 Cloudflare 403）</option>
+      <option value="xhr">直接请求（GM_xmlhttpRequest）</option>
+    `;
+    signModeSelect.value = getDailySignMode(settings);
+    signModeLabel.appendChild(signModeSelect);
+    const signTabActiveLabel = document.createElement('label');
+    signTabActiveLabel.innerHTML = `
+      <input type="checkbox" data-sign-tab-active ${settings.dailySignTabActive ? 'checked' : ''}>
+      标签页前台激活（关闭则后台打开）
+    `;
+    const signWaitLabel = document.createElement('label');
+    signWaitLabel.textContent = 'WaitOfCloudflare(秒) ';
+    const signWaitInput = document.createElement('input');
+    signWaitInput.type = 'number';
+    signWaitInput.min = '0';
+    signWaitInput.step = '1';
+    signWaitInput.dataset.signWaitOfCloudflare = '1';
+    signWaitInput.value = String(getWaitOfCloudflareSec(settings));
+    signWaitLabel.appendChild(signWaitInput);
+    signModeRow.append(signModeLabel, signTabActiveLabel, signWaitLabel);
+
     const signOptionsRow = document.createElement('div');
     signOptionsRow.className = 'jm-form-row';
     signOptionsRow.innerHTML = `
       <label><input type="checkbox" data-auto-daily-sign ${settings.autoDailySignEnabled ? 'checked' : ''}> 启用自动签到（每天仅一次）</label>
       <label><input type="checkbox" data-daily-sign-debug ${settings.dailySignDebug ? 'checked' : ''}> 启用签到调试日志（控制台）</label>
     `;
+
+    const signCamouflageModeRow = document.createElement('div');
+    signCamouflageModeRow.className = 'jm-form-row';
+    const signCamouflageModeLabel = document.createElement('label');
+    signCamouflageModeLabel.textContent = 'Camouflage ';
+    const signCamouflageModeSelect = document.createElement('select');
+    signCamouflageModeSelect.dataset.signCamouflageMode = '1';
+    signCamouflageModeSelect.innerHTML = `
+      <option value="off">off</option>
+      <option value="sign">during daily sign only</option>
+      <option value="always">always</option>
+    `;
+    signCamouflageModeSelect.value = getDailySignCamouflageMode(settings);
+    signCamouflageModeLabel.appendChild(signCamouflageModeSelect);
+    const signCamouflageTitleLabel = document.createElement('label');
+    signCamouflageTitleLabel.textContent = 'title ';
+    const signCamouflageTitleInput = document.createElement('input');
+    signCamouflageTitleInput.type = 'text';
+    signCamouflageTitleInput.dataset.signCamouflageTitle = '1';
+    signCamouflageTitleInput.value = settings.dailySignCamouflageTitle || '';
+    signCamouflageTitleLabel.appendChild(signCamouflageTitleInput);
+    signCamouflageModeRow.append(signCamouflageModeLabel, signCamouflageTitleLabel);
+
+    const signCamouflageIconRow = document.createElement('div');
+    signCamouflageIconRow.className = 'jm-form-row';
+    const signCamouflageIconLabel = document.createElement('label');
+    signCamouflageIconLabel.textContent = 'icon ';
+    const signCamouflageIconInput = document.createElement('input');
+    signCamouflageIconInput.type = 'text';
+    signCamouflageIconInput.dataset.signCamouflageIcon = '1';
+    signCamouflageIconInput.value = settings.dailySignCamouflageIcon || '';
+    signCamouflageIconInput.placeholder = 'https://example.com/favicon.ico';
+    signCamouflageIconLabel.appendChild(signCamouflageIconInput);
+    signCamouflageIconRow.append(signCamouflageIconLabel);
 
     const signDebugRow = document.createElement('div');
     signDebugRow.className = 'jm-form-row';
@@ -1021,52 +2166,187 @@
     signDebugBtn.title = '会先保存当前设置，再立即发起一次签到请求';
     signDebugRow.appendChild(signDebugBtn);
 
+    const debugLogSection = document.createElement('div');
+    debugLogSection.className = 'jm-section';
+    const debugLogTitle = document.createElement('h4');
+    debugLogTitle.textContent = '签到调试日志（最近一次）';
+    const debugLogHint = document.createElement('div');
+    debugLogHint.className = 'jm-hint';
+    debugLogHint.textContent =
+      '每次新签到会覆盖上一轮日志（包含请求参数、返回状态与响应内容）。可清除今日签到记录用于复现流程，不会立即自动签到。';
+    const debugLogActions = document.createElement('div');
+    debugLogActions.className = 'jm-form-row';
+    const refreshDebugLogBtn = document.createElement('button');
+    refreshDebugLogBtn.type = 'button';
+    refreshDebugLogBtn.textContent = '刷新日志';
+    const clearDebugLogBtn = document.createElement('button');
+    clearDebugLogBtn.type = 'button';
+    clearDebugLogBtn.textContent = '清空日志';
+    const clearTodaySignBtn = document.createElement('button');
+    clearTodaySignBtn.type = 'button';
+    clearTodaySignBtn.textContent = '清除今日签到记录';
+    const invisibleToggleBtn = document.createElement('button');
+    invisibleToggleBtn.type = 'button';
+    debugLogActions.append(refreshDebugLogBtn, clearDebugLogBtn, clearTodaySignBtn, invisibleToggleBtn);
+    const debugLogTextarea = document.createElement('textarea');
+    debugLogTextarea.className = 'jm-debug-log-textarea';
+    debugLogTextarea.readOnly = true;
+    debugLogSection.append(debugLogTitle, debugLogHint, debugLogActions, debugLogTextarea);
+
     const collectAndSaveSettings = () => {
       const normalizedSignOrigin = normalizeSignOrigin(signAddressInput.value);
+      const rememberUiState = uiMemoryRow.querySelector('input[data-remember-ui-state]').checked;
+      const debugEnabled = signOptionsRow.querySelector('input[data-daily-sign-debug]').checked;
       setSettings({
         headerTitle: headerInput.value.trim() || DEFAULT_SETTINGS.headerTitle,
         favoriteIntervalMs: Math.max(500, Number(intervalInput.value) || DEFAULT_SETTINGS.favoriteIntervalMs),
         favoriteFid: fidInput.value.trim() || DEFAULT_SETTINGS.favoriteFid,
         autoSyncFavoriteAdd: syncRow.querySelector('input[data-sync-add]').checked,
         autoSyncFavoriteDelete: syncRow.querySelector('input[data-sync-delete]').checked,
+        takeoverNativeFavorite: takeoverNativeFavoriteRow.querySelector('input[data-takeover-native-favorite]').checked,
+        rememberUiState,
         dailySignAddress: normalizedSignOrigin,
+        dailySignUsername: String(signUsernameInput.value || '').trim(),
+        dailySignPassword: String(signPasswordInput.value || '').trim(),
         dailySignDailyId: String(signDailyIdInput.value || '').trim(),
         dailySignOldStep: String(signOldStepInput.value || '').trim(),
+        dailySignMode: signModeSelect.value === 'xhr' ? 'xhr' : 'tab',
+        dailySignTabActive: signModeRow.querySelector('input[data-sign-tab-active]').checked,
+        dailySignWaitOfCloudflareSec: Math.max(
+          0,
+          Number(signModeRow.querySelector('input[data-sign-wait-of-cloudflare]').value) ||
+            DEFAULT_SETTINGS.dailySignWaitOfCloudflareSec
+        ),
         autoDailySignEnabled: signOptionsRow.querySelector('input[data-auto-daily-sign]').checked,
-        dailySignDebug: signOptionsRow.querySelector('input[data-daily-sign-debug]').checked,
+        dailySignDebug: debugEnabled,
+        dailySignCamouflageMode: getDailySignCamouflageMode({
+          dailySignCamouflageMode: signCamouflageModeSelect.value,
+        }),
+        dailySignCamouflageTitle: String(signCamouflageTitleInput.value || '').trim(),
+        dailySignCamouflageIcon: String(signCamouflageIconInput.value || '').trim(),
       });
-      return normalizedSignOrigin;
+      if (!rememberUiState) {
+        clearUiMemory();
+      } else {
+        setUiMemory({
+          windowVisible: isMainWindowVisible(),
+          sortField: state.sortField,
+          sortAsc: state.sortAsc,
+        });
+      }
+      return {
+        normalizedSignOrigin,
+        rememberUiState,
+        debugEnabled,
+      };
     };
+
+    const renderDebugLogView = () => {
+      debugLogTextarea.value = buildDailySignDebugLogText();
+      debugLogTextarea.scrollTop = 0;
+    };
+
+    const renderInvisibleButton = () => {
+      invisibleToggleBtn.textContent = invisibleState.enabled ? '停用 invisible' : '启用 invisible';
+    };
+
+    const updateDebugLogVisibility = () => {
+      const checked = signOptionsRow.querySelector('input[data-daily-sign-debug]').checked;
+      debugLogSection.style.display = checked ? '' : 'none';
+      if (checked) {
+        renderDebugLogView();
+      } else if (invisibleState.enabled) {
+        setInvisibleEnabled(false);
+        renderInvisibleButton();
+      }
+    };
+
+    refreshDebugLogBtn.addEventListener('click', () => {
+      renderDebugLogView();
+      notify('调试日志已刷新。');
+    });
+    clearDebugLogBtn.addEventListener('click', () => {
+      clearDailySignDebugLog();
+      renderDebugLogView();
+      notify('调试日志已清空。');
+    });
+    clearTodaySignBtn.addEventListener('click', () => {
+      const checked = signOptionsRow.querySelector('input[data-daily-sign-debug]').checked;
+      if (!checked) {
+        notify('仅在启用调试日志时可用。');
+        return;
+      }
+      const result = clearTodayDailySignRecordForDebug();
+      if (result.changed) {
+        notify('已清除今日签到记录（不会立刻自动签到）。');
+      } else {
+        notify('今日签到记录本来就是空。');
+      }
+    });
+    invisibleToggleBtn.addEventListener('click', () => {
+      const checked = signOptionsRow.querySelector('input[data-daily-sign-debug]').checked;
+      if (!checked) {
+        notify('仅在启用调试日志时可用。');
+        return;
+      }
+      const result = setInvisibleEnabled(!invisibleState.enabled);
+      renderInvisibleButton();
+      if (result.enabled) {
+        notify(`invisible 已启用，已移除 ${result.removedImages} 个图片元素。`);
+      } else {
+        notify('invisible 已停用（已移除的图片需刷新页面恢复）。');
+      }
+    });
+    renderInvisibleButton();
+    signOptionsRow.querySelector('input[data-daily-sign-debug]').addEventListener('change', () => {
+      updateDebugLogVisibility();
+    });
+    updateDebugLogVisibility();
 
     const saveBtn = document.createElement('button');
     saveBtn.type = 'button';
     saveBtn.textContent = '保存设置';
     saveBtn.addEventListener('click', () => {
-      const normalizedSignOrigin = collectAndSaveSettings();
+      const result = collectAndSaveSettings();
       const rawSignAddress = signAddressInput.value.trim();
-      if (rawSignAddress && !normalizedSignOrigin) {
+      if (rawSignAddress && !result.normalizedSignOrigin) {
         notify('签到地址格式无效，已清空签到地址。');
       }
-      notify('设置已保存。');
+      updateDebugLogVisibility();
+      notify(result.rememberUiState ? '设置已保存。' : '设置已保存，记忆内容已清空。');
       const header = document.querySelector('.jm-title');
       if (header) {
         header.textContent = getSettings().headerTitle;
       }
+      applyDailySignCamouflageIfNeeded(getSettings());
+      applyNativeFavoriteTakeoverIfNeeded(getSettings());
     });
 
     signDebugBtn.addEventListener('click', () => {
-      collectAndSaveSettings();
+      const result = collectAndSaveSettings();
       triggerDailySign({ manual: true });
+      if (result.debugEnabled) {
+        setTimeout(() => {
+          renderDebugLogView();
+        }, 800);
+      }
     });
 
     panel.append(
       headerRow,
       favoriteRow,
       syncRow,
+      takeoverNativeFavoriteRow,
+      uiMemoryRow,
       signAddressRow,
+      signAuthRow,
       signParamsRow,
+      signModeRow,
       signOptionsRow,
+      signCamouflageModeRow,
+      signCamouflageIconRow,
       signDebugRow,
+      debugLogSection,
       saveBtn
     );
     content.appendChild(panel);
@@ -1250,6 +2530,14 @@
         }
         if (!window.confirm('请再次确认：删除后不可恢复。')) {
           return;
+        }
+        const shouldDeleteOnSite = isFavoriteTakeoverActive() && isTakeoverNativeFavoriteEnabled();
+        if (shouldDeleteOnSite) {
+          requestDeleteFavoriteAlbumFromSite(id).then((ok) => {
+            if (!ok) {
+              notify(`站点删除请求可能失败，ID: ${id}`);
+            }
+          });
         }
         const nextFolder = removeItemFromFolder(folder, id);
         updateFolder(nextFolder);
@@ -1517,6 +2805,55 @@
     return params.get('album_id');
   }
 
+  function isTakeoverNativeFavoriteEnabled(settings = getSettings()) {
+    return Boolean(settings.takeoverNativeFavorite);
+  }
+
+  function isFavoriteTakeoverActive() {
+    return Boolean(favoriteTakeoverState.mounted && favoriteTakeoverState.host && document.body.contains(favoriteTakeoverState.host));
+  }
+
+  function buildFavoriteAlbumOverloadedResponseText(rawText) {
+    const text = String(rawText || '');
+    let parsed = null;
+    try {
+      parsed = JSON.parse(text);
+    } catch (error) {
+      return { changed: false, text };
+    }
+    if (!parsed || Number(parsed.status) !== 0) {
+      return { changed: false, text };
+    }
+    return {
+      changed: true,
+      text: JSON.stringify(FAVORITE_ALBUM_OVERLOADED_RESPONSE),
+    };
+  }
+
+  function shouldOverrideFavoriteAlbumResponse(url) {
+    return isTakeoverNativeFavoriteEnabled() && typeof url === 'string' && url.includes('/ajax/favorite_album');
+  }
+
+  function requestDeleteFavoriteAlbumFromSite(albumId) {
+    if (!albumId) {
+      return Promise.resolve(false);
+    }
+    const settings = getSettings();
+    const payload = `album_id=${encodeURIComponent(albumId)}&fid=${encodeURIComponent(settings.favoriteFid || '0')}`;
+    const endpoint = `${window.location.origin}/ajax/delete_favorite_album`;
+    return fetch(endpoint, {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+      body: payload,
+    })
+      .then((response) => response.status >= 200 && response.status < 300)
+      .catch(() => false);
+  }
+
   function getSyncAddedTitle() {
     const selectors = ['.book-name.mb-0#book-name', '.pull-left'];
     for (const selector of selectors) {
@@ -1570,12 +2907,33 @@
             syncFavoriteChange('delete', parseAlbumIdFromBody(body));
           }
         }
-        return originalFetch.apply(this, args);
+        return originalFetch.apply(this, args).then((response) => {
+          if (!shouldOverrideFavoriteAlbumResponse(url)) {
+            return response;
+          }
+          return response
+            .clone()
+            .text()
+            .then((rawText) => {
+              const overridden = buildFavoriteAlbumOverloadedResponseText(rawText);
+              if (!overridden.changed) {
+                return response;
+              }
+              return new Response(overridden.text, {
+                status: response.status,
+                statusText: response.statusText,
+                headers: new Headers(response.headers),
+              });
+            })
+            .catch(() => response);
+        });
       };
     }
 
     const originalOpen = XMLHttpRequest.prototype.open;
     const originalSend = XMLHttpRequest.prototype.send;
+    const responseTextDescriptor = Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, 'responseText');
+    const responseDescriptor = Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, 'response');
     XMLHttpRequest.prototype.open = function (method, url, ...rest) {
       this._jmUrl = url;
       return originalOpen.call(this, method, url, ...rest);
@@ -1589,6 +2947,65 @@
           syncFavoriteChange('delete', parseAlbumIdFromBody(body));
         }
       }
+
+      if (
+        shouldOverrideFavoriteAlbumResponse(url) &&
+        responseTextDescriptor &&
+        typeof responseTextDescriptor.get === 'function'
+      ) {
+        let patchedReady = false;
+        let patchedText = '';
+        const getPatchedText = () => {
+          if (patchedReady) {
+            return patchedText;
+          }
+          let rawText = '';
+          try {
+            rawText = responseTextDescriptor.get.call(this);
+          } catch (error) {
+            rawText = '';
+          }
+          const overridden = buildFavoriteAlbumOverloadedResponseText(rawText);
+          patchedReady = true;
+          patchedText = overridden.changed ? overridden.text : rawText;
+          return patchedText;
+        };
+
+        try {
+          Object.defineProperty(this, 'responseText', {
+            configurable: true,
+            get: () => {
+              if (this.readyState !== 4) {
+                return responseTextDescriptor.get.call(this);
+              }
+              return getPatchedText();
+            },
+          });
+        } catch (error) {
+          // ignore when browser blocks instance-level override
+        }
+
+        if (responseDescriptor && typeof responseDescriptor.get === 'function') {
+          try {
+            Object.defineProperty(this, 'response', {
+              configurable: true,
+              get: () => {
+                const type = this.responseType;
+                if (type && type !== 'text') {
+                  return responseDescriptor.get.call(this);
+                }
+                if (this.readyState !== 4) {
+                  return responseDescriptor.get.call(this);
+                }
+                return getPatchedText();
+              },
+            });
+          } catch (error) {
+            // ignore when browser blocks instance-level override
+          }
+        }
+      }
+
       return originalSend.call(this, body);
     };
   }
@@ -1657,9 +3074,76 @@
     handle.addEventListener('mousedown', onMouseDown);
   }
 
+  function findNativeFavoriteRowContainer() {
+    const rows = Array.from(document.querySelectorAll('div.row'));
+    return rows.find((row) => row.querySelector('[id^="favorites_album_"]')) || null;
+  }
+
+  function mountNativeFavoriteTakeover() {
+    if (favoriteTakeoverState.mounted && favoriteTakeoverState.host && document.body.contains(favoriteTakeoverState.host)) {
+      return true;
+    }
+    const originalRow = findNativeFavoriteRowContainer();
+    if (!originalRow || !originalRow.parentElement) {
+      return false;
+    }
+
+    const host = document.createElement('div');
+    host.className = 'jm-takeover-host';
+
+    const container = document.createElement('div');
+    container.className = 'jm-container jm-takeover-container';
+    const settings = getSettings();
+    container.style.setProperty('--jm-thumb-width', `${settings.thumbWidth}px`);
+    container.style.setProperty('--jm-thumb-height', `${settings.thumbHeight}px`);
+    buildTabs(container);
+    host.appendChild(container);
+
+    originalRow.style.display = 'none';
+    originalRow.parentElement.insertBefore(host, originalRow);
+
+    favoriteTakeoverState.mounted = true;
+    favoriteTakeoverState.host = host;
+    favoriteTakeoverState.originalRow = originalRow;
+
+    const folder = getActiveFolder();
+    if (folder) {
+      const merged = addItemsToFolder(folder, captureCurrentPage());
+      updateFolder(merged);
+    }
+    refreshFolderList();
+    refreshTrustedDomainList();
+    refreshGrid();
+    return true;
+  }
+
+  function unmountNativeFavoriteTakeover() {
+    if (favoriteTakeoverState.host && document.body.contains(favoriteTakeoverState.host)) {
+      favoriteTakeoverState.host.remove();
+    }
+    if (favoriteTakeoverState.originalRow) {
+      favoriteTakeoverState.originalRow.style.display = '';
+    }
+    favoriteTakeoverState.mounted = false;
+    favoriteTakeoverState.host = null;
+    favoriteTakeoverState.originalRow = null;
+  }
+
+  function applyNativeFavoriteTakeoverIfNeeded(settings = getSettings()) {
+    if (!isTakeoverNativeFavoriteEnabled(settings)) {
+      unmountNativeFavoriteTakeover();
+      return false;
+    }
+    return mountNativeFavoriteTakeover();
+  }
+
   function mountUI() {
+    if (getMainContainer()) {
+      return;
+    }
     const container = document.createElement('div');
     container.className = 'jm-container';
+    container.dataset.jmMainWindow = '1';
     container.style.left = '30px';
     container.style.top = '30px';
     container.style.width = '820px';
@@ -1675,6 +3159,11 @@
     refreshFolderList();
     refreshTrustedDomainList();
     refreshGrid();
+    persistUiMemory({
+      windowVisible: true,
+      sortField: state.sortField,
+      sortAsc: state.sortAsc,
+    });
   }
 
   function addToastStyles() {
@@ -1707,6 +3196,16 @@
   }
 
   function registerMenus() {
+    GM_registerMenuCommand('显示/隐藏主悬浮窗', () => {
+      if (!isDomainApproved()) {
+        notify('当前域名未被认可，无法显示主悬浮窗。');
+        return;
+      }
+      const nextVisible = !isMainWindowVisible();
+      setMainWindowVisible(nextVisible);
+      notify(nextVisible ? '主悬浮窗已显示。' : '主悬浮窗已隐藏。');
+    });
+
     GM_registerMenuCommand('立即触发签到(忽略每日限制)', () => {
       triggerDailySign({ manual: true });
     });
@@ -1733,6 +3232,11 @@
 
   function init() {
     addToastStyles();
+    applyDailySignCamouflageIfNeeded(getSettings());
+    if (runDailySignWorkerIfNeeded()) {
+      return;
+    }
+    applyUiMemoryToState();
     registerMenus();
     triggerDailySign();
 
@@ -1743,7 +3247,10 @@
     addStyles();
     ensureDefaultFolder();
     interceptAjax();
-    mountUI();
+    const takeoverMounted = applyNativeFavoriteTakeoverIfNeeded(getSettings());
+    if (!takeoverMounted && shouldShowMainWindowOnInit()) {
+      mountUI();
+    }
     processCaptureState();
   }
 
@@ -1765,6 +3272,22 @@
         min-height: 520px;
         max-width: 100vw;
         max-height: 100vh;
+      }
+      .jm-takeover-host {
+        margin-bottom: 14px;
+      }
+      .jm-takeover-container {
+        position: relative;
+        left: auto !important;
+        top: auto !important;
+        width: 100%;
+        height: 760px;
+        min-width: 0;
+        min-height: 520px;
+        max-width: 100%;
+        max-height: none;
+        resize: none;
+        border-radius: 10px;
       }
       .jm-container.fullscreen {
         border-radius: 0;
@@ -1976,6 +3499,7 @@
         align-items: center;
       }
       .jm-form-row input[type="text"],
+      .jm-form-row input[type="password"],
       .jm-form-row input[type="number"],
       .jm-form-row select {
         margin-left: 6px;
@@ -1992,6 +3516,20 @@
         padding: 6px 10px;
         border-radius: 6px;
         cursor: pointer;
+      }
+      .jm-debug-log-textarea {
+        width: 100%;
+        min-height: 260px;
+        padding: 10px;
+        border-radius: 6px;
+        border: 1px solid #444;
+        background: #181818;
+        color: #ddd;
+        font-family: Consolas, "Courier New", monospace;
+        font-size: 12px;
+        line-height: 1.5;
+        resize: vertical;
+        box-sizing: border-box;
       }
       .jm-empty {
         color: #aaa;
