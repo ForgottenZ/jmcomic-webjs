@@ -1156,7 +1156,20 @@
 
   function runDailySignWorkerIfNeeded() {
     const pageUrl = new URL(window.location.href);
-    if (!pageUrl.searchParams.has(DAILY_SIGN_WORKER_FLAG) && !pageUrl.searchParams.has(DAILY_SIGN_WORKER_TOKEN)) {
+    const hasWorkerFlag =
+      pageUrl.searchParams.has(DAILY_SIGN_WORKER_FLAG) || pageUrl.searchParams.has(DAILY_SIGN_WORKER_TOKEN);
+    const task = getDailySignWorkerTask();
+    const taskSignOrigin = normalizeSignOrigin(task?.signOrigin || '');
+    const taskCreatedAt = Number(task?.createdAt || 0);
+    const taskAgeMs = taskCreatedAt > 0 ? Date.now() - taskCreatedAt : Number.POSITIVE_INFINITY;
+    const fallbackByRecentTask =
+      !hasWorkerFlag &&
+      Boolean(task) &&
+      taskSignOrigin === window.location.origin &&
+      taskAgeMs >= 0 &&
+      taskAgeMs <= 10 * 60 * 1000 &&
+      Boolean(window.opener);
+    if (!hasWorkerFlag && !fallbackByRecentTask) {
       return false;
     }
     if (window.top !== window.self) {
@@ -1166,15 +1179,17 @@
     const settings = getSettings();
     const debugEnabled = Boolean(settings.dailySignDebug);
     const taskToken = pageUrl.searchParams.get(DAILY_SIGN_WORKER_TOKEN) || '';
-    const task = getDailySignWorkerTask();
     const debugSessionId = task?.debugSessionId || null;
-    if (!taskToken || !task || task.token !== taskToken) {
+    const isTokenMatched = hasWorkerFlag ? taskToken && task && task.token === taskToken : Boolean(task);
+    if (!isTokenMatched) {
       logDailySignDebug(
         debugEnabled,
         '签到工作页任务缺失或 token 不匹配，直接关闭',
         {
           url: window.location.href,
           taskToken,
+          hasWorkerFlag,
+          fallbackByRecentTask,
           taskExists: Boolean(task),
         },
         debugSessionId
@@ -1224,6 +1239,20 @@
           debugSessionId
         );
         await new Promise((resolve) => setTimeout(resolve, waitOfCloudflareSec * 1000));
+      }
+
+      if (fallbackByRecentTask) {
+        logDailySignDebug(
+          debugEnabled,
+          '签到工作页通过近期任务兜底识别（query 参数缺失）',
+          {
+            url: window.location.href,
+            taskCreatedAt,
+            taskAgeMs,
+            openerExists: Boolean(window.opener),
+          },
+          debugSessionId
+        );
       }
 
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
