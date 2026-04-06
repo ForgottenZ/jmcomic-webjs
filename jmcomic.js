@@ -1245,7 +1245,31 @@
     const debugEnabled = Boolean(settings.dailySignDebug);
     const taskToken = pageUrl.searchParams.get(DAILY_SIGN_WORKER_TOKEN) || '';
     const debugSessionId = task?.debugSessionId || null;
-    const isTokenMatched = hasWorkerFlag ? taskToken && task && task.token === taskToken : Boolean(task);
+    const allowRecentSameOriginTokenMismatch =
+      hasWorkerFlag &&
+      Boolean(task) &&
+      Boolean(taskToken) &&
+      task.token !== taskToken &&
+      taskSignOrigin === window.location.origin &&
+      taskAgeMs >= 0 &&
+      taskAgeMs <= 2 * 60 * 1000;
+    const isTokenMatched = hasWorkerFlag
+      ? (taskToken && task && task.token === taskToken) || allowRecentSameOriginTokenMismatch
+      : Boolean(task);
+    if (allowRecentSameOriginTokenMismatch) {
+      logDailySignDebug(
+        debugEnabled,
+        '签到工作页 token 与任务不一致，已按近期同源任务兜底',
+        {
+          url: window.location.href,
+          taskToken,
+          currentTaskToken: task?.token || '',
+          taskAgeMs,
+          taskSignOrigin,
+        },
+        debugSessionId
+      );
+    }
     if (!isTokenMatched) {
       logDailySignDebug(
         debugEnabled,
