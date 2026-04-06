@@ -518,24 +518,34 @@
     delayMs = 0,
     intervalMs = 1000,
     maxAttempts = 12,
+    forceClose = false,
     debugEnabled = false,
     debugSessionId = null,
     reason = 'completed',
   } = {}) {
     const startCloseLoop = () => {
-      if (!isDailySignWorkerUrl()) {
+      if (!forceClose && !isDailySignWorkerUrl()) {
         return;
       }
 
       let attempts = 0;
-      window.close();
+      const tryClose = () => {
+        window.close();
+        try {
+          window.open('', '_self');
+          window.close();
+        } catch (error) {
+          // ignore
+        }
+      };
+      tryClose();
       const timer = setInterval(() => {
-        if (!isDailySignWorkerUrl()) {
+        if (!forceClose && !isDailySignWorkerUrl()) {
           clearInterval(timer);
           return;
         }
         attempts += 1;
-        window.close();
+        tryClose();
         if (attempts >= maxAttempts) {
           clearInterval(timer);
         }
@@ -549,6 +559,7 @@
           delayMs,
           intervalMs,
           maxAttempts,
+          forceClose,
           page: window.location.href,
         },
         debugSessionId
@@ -1257,6 +1268,7 @@
         delayMs: 300,
         intervalMs: 1000,
         maxAttempts: 12,
+        forceClose: true,
         debugEnabled,
         debugSessionId,
         reason: 'worker_task_mismatch',
@@ -1453,6 +1465,7 @@
         delayMs: 800,
         intervalMs: 1000,
         maxAttempts: 12,
+        forceClose: true,
         debugEnabled,
         debugSessionId,
         reason: 'worker_finished',
@@ -3327,11 +3340,12 @@
   function init() {
     addToastStyles();
     applyDailySignCamouflageIfNeeded(getSettings());
-    if (runDailySignWorkerIfNeeded()) {
-      return;
-    }
+    const inWorkerMode = runDailySignWorkerIfNeeded();
     applyUiMemoryToState();
     registerMenus();
+    if (inWorkerMode) {
+      return;
+    }
     triggerDailySign();
 
     if (!isDomainApproved()) {
