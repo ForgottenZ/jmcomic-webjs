@@ -43,6 +43,7 @@
     dailySignUsername: '',
     dailySignPassword: '',
     dailySignDailyId: '',
+    dailySignDailyIdMode: 'manual',
     dailySignOldStep: '',
     autoDailySignEnabled: true,
     dailySignMode: 'tab',
@@ -517,24 +518,34 @@
     delayMs = 0,
     intervalMs = 1000,
     maxAttempts = 12,
+    forceClose = false,
     debugEnabled = false,
     debugSessionId = null,
     reason = 'completed',
   } = {}) {
     const startCloseLoop = () => {
-      if (!isDailySignWorkerUrl()) {
+      if (!forceClose && !isDailySignWorkerUrl()) {
         return;
       }
 
       let attempts = 0;
-      window.close();
+      const tryClose = () => {
+        window.close();
+        try {
+          window.open('', '_self');
+          window.close();
+        } catch (error) {
+          // ignore
+        }
+      };
+      tryClose();
       const timer = setInterval(() => {
-        if (!isDailySignWorkerUrl()) {
+        if (!forceClose && !isDailySignWorkerUrl()) {
           clearInterval(timer);
           return;
         }
         attempts += 1;
-        window.close();
+        tryClose();
         if (attempts >= maxAttempts) {
           clearInterval(timer);
         }
@@ -548,6 +559,7 @@
           delayMs,
           intervalMs,
           maxAttempts,
+          forceClose,
           page: window.location.href,
         },
         debugSessionId
@@ -755,11 +767,53 @@
       return null;
     }
 
-    const dailyId = String(settings.dailySignDailyId || '').trim();
+    const dailyIdMode = settings.dailySignDailyIdMode === 'auto' ? 'auto' : 'manual';
+    const readDailyIdFromPage = () => {
+      const popup = document.querySelector('#bouns-popup');
+      const candidates = [];
+      if (typeof window.$ === 'function') {
+        try {
+          const jqValue = window.$('#bouns-popup')?.data?.('dailyid');
+          candidates.push(jqValue);
+        } catch (error) {
+          // ignore
+        }
+      }
+      if (popup) {
+        candidates.push(
+          popup?.dataset?.dailyid,
+          popup?.dataset?.dailyId,
+          popup.getAttribute('data-dailyid'),
+          popup.getAttribute('data-daily-id')
+        );
+      }
+      const matched = candidates.find((item) => String(item || '').trim());
+      return String(matched || '').trim();
+    };
+    const configuredDailyId = String(settings.dailySignDailyId || '').trim();
+    let dailyId = configuredDailyId;
+    let dailyIdSource = 'manual_input';
+    if (dailyIdMode === 'auto') {
+      const autoDetected = readDailyIdFromPage();
+      if (autoDetected) {
+        dailyId = autoDetected;
+        dailyIdSource = 'auto_page';
+      } else if (configuredDailyId) {
+        dailyId = configuredDailyId;
+        dailyIdSource = 'auto_fallback_manual';
+      } else {
+        dailyId = '';
+        dailyIdSource = 'auto_page_missing';
+      }
+    }
     const oldStep = String(settings.dailySignOldStep || '').trim();
     if (!dailyId || !oldStep) {
       if (manual) {
-        notify('请先设置签到参数 daily_id 和 oldStep。');
+        if (!dailyId && dailyIdMode === 'auto') {
+          notify('自动获取 daily_id 失败，请刷新页面后重试，或切换到手动填写。');
+        } else {
+          notify('请先设置签到参数 daily_id 和 oldStep。');
+        }
       }
       return null;
     }
@@ -769,6 +823,8 @@
       dailySignUsername: username,
       dailySignPassword: password,
       dailySignDailyId: dailyId,
+      dailySignDailyIdMode: dailyIdMode,
+      dailySignDailyIdSource: dailyIdSource,
       dailySignOldStep: oldStep,
     };
   }
@@ -1008,6 +1064,8 @@
       dailySignUsername: config.dailySignUsername,
       dailySignPassword: config.dailySignPassword,
       dailySignDailyId: config.dailySignDailyId,
+      dailySignDailyIdMode: config.dailySignDailyIdMode,
+      dailySignDailyIdSource: config.dailySignDailyIdSource,
       dailySignOldStep: config.dailySignOldStep,
       waitOfCloudflareSec,
       debugSessionId,
@@ -1025,6 +1083,9 @@
       workerUrl,
       active,
       waitOfCloudflareSec,
+      dailySignDailyId: config.dailySignDailyId,
+      dailySignDailyIdMode: config.dailySignDailyIdMode,
+      dailySignDailyIdSource: config.dailySignDailyIdSource,
       },
       debugSessionId
     );
@@ -1089,6 +1150,7 @@
         dailySignUsername: settings.dailySignUsername || '',
         dailySignPassword: settings.dailySignPassword ? '******' : '',
         dailySignDailyId: settings.dailySignDailyId || '',
+        dailySignDailyIdMode: settings.dailySignDailyIdMode === 'auto' ? 'auto' : 'manual',
         dailySignOldStep: settings.dailySignOldStep || '',
       });
       return;
@@ -1127,6 +1189,9 @@
         manual,
         mode,
         signOrigin: config.signOrigin,
+        dailySignDailyId: config.dailySignDailyId,
+        dailySignDailyIdMode: config.dailySignDailyIdMode,
+        dailySignDailyIdSource: config.dailySignDailyIdSource,
         waitOfCloudflareSec: getWaitOfCloudflareSec(settings),
       },
       debugSessionId
@@ -1156,7 +1221,20 @@
 
   function runDailySignWorkerIfNeeded() {
     const pageUrl = new URL(window.location.href);
-    if (!pageUrl.searchParams.has(DAILY_SIGN_WORKER_FLAG) && !pageUrl.searchParams.has(DAILY_SIGN_WORKER_TOKEN)) {
+    const hasWorkerFlag =
+      pageUrl.searchParams.has(DAILY_SIGN_WORKER_FLAG) || pageUrl.searchParams.has(DAILY_SIGN_WORKER_TOKEN);
+    const task = getDailySignWorkerTask();
+    const taskSignOrigin = normalizeSignOrigin(task?.signOrigin || '');
+    const taskCreatedAt = Number(task?.createdAt || 0);
+    const taskAgeMs = taskCreatedAt > 0 ? Date.now() - taskCreatedAt : Number.POSITIVE_INFINITY;
+    const fallbackByRecentTask =
+      !hasWorkerFlag &&
+      Boolean(task) &&
+      taskSignOrigin === window.location.origin &&
+      taskAgeMs >= 0 &&
+      taskAgeMs <= 10 * 60 * 1000 &&
+      Boolean(window.opener);
+    if (!hasWorkerFlag && !fallbackByRecentTask) {
       return false;
     }
     if (window.top !== window.self) {
@@ -1166,15 +1244,41 @@
     const settings = getSettings();
     const debugEnabled = Boolean(settings.dailySignDebug);
     const taskToken = pageUrl.searchParams.get(DAILY_SIGN_WORKER_TOKEN) || '';
-    const task = getDailySignWorkerTask();
     const debugSessionId = task?.debugSessionId || null;
-    if (!taskToken || !task || task.token !== taskToken) {
+    const allowRecentSameOriginTokenMismatch =
+      hasWorkerFlag &&
+      Boolean(task) &&
+      Boolean(taskToken) &&
+      task.token !== taskToken &&
+      taskSignOrigin === window.location.origin &&
+      taskAgeMs >= 0 &&
+      taskAgeMs <= 2 * 60 * 1000;
+    const isTokenMatched = hasWorkerFlag
+      ? (taskToken && task && task.token === taskToken) || allowRecentSameOriginTokenMismatch
+      : Boolean(task);
+    if (allowRecentSameOriginTokenMismatch) {
+      logDailySignDebug(
+        debugEnabled,
+        '签到工作页 token 与任务不一致，已按近期同源任务兜底',
+        {
+          url: window.location.href,
+          taskToken,
+          currentTaskToken: task?.token || '',
+          taskAgeMs,
+          taskSignOrigin,
+        },
+        debugSessionId
+      );
+    }
+    if (!isTokenMatched) {
       logDailySignDebug(
         debugEnabled,
         '签到工作页任务缺失或 token 不匹配，直接关闭',
         {
           url: window.location.href,
           taskToken,
+          hasWorkerFlag,
+          fallbackByRecentTask,
           taskExists: Boolean(task),
         },
         debugSessionId
@@ -1188,6 +1292,7 @@
         delayMs: 300,
         intervalMs: 1000,
         maxAttempts: 12,
+        forceClose: true,
         debugEnabled,
         debugSessionId,
         reason: 'worker_task_mismatch',
@@ -1224,6 +1329,20 @@
           debugSessionId
         );
         await new Promise((resolve) => setTimeout(resolve, waitOfCloudflareSec * 1000));
+      }
+
+      if (fallbackByRecentTask) {
+        logDailySignDebug(
+          debugEnabled,
+          '签到工作页通过近期任务兜底识别（query 参数缺失）',
+          {
+            url: window.location.href,
+            taskCreatedAt,
+            taskAgeMs,
+            openerExists: Boolean(window.opener),
+          },
+          debugSessionId
+        );
       }
 
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -1370,6 +1489,7 @@
         delayMs: 800,
         intervalMs: 1000,
         maxAttempts: 12,
+        forceClose: true,
         debugEnabled,
         debugSessionId,
         reason: 'worker_finished',
@@ -2073,6 +2193,16 @@
 
     const signParamsRow = document.createElement('div');
     signParamsRow.className = 'jm-form-row';
+    const signDailyIdModeLabel = document.createElement('label');
+    signDailyIdModeLabel.textContent = 'daily_id来源 ';
+    const signDailyIdModeSelect = document.createElement('select');
+    signDailyIdModeSelect.dataset.signDailyIdMode = '1';
+    signDailyIdModeSelect.innerHTML = `
+      <option value="manual">手动填写</option>
+      <option value="auto">自动获取(#bouns-popup)</option>
+    `;
+    signDailyIdModeSelect.value = settings.dailySignDailyIdMode === 'auto' ? 'auto' : 'manual';
+    signDailyIdModeLabel.appendChild(signDailyIdModeSelect);
     const signDailyIdLabel = document.createElement('label');
     signDailyIdLabel.textContent = 'daily_id ';
     const signDailyIdInput = document.createElement('input');
@@ -2087,7 +2217,7 @@
     signOldStepInput.dataset.signOldStep = '1';
     signOldStepInput.value = settings.dailySignOldStep || '';
     signOldStepLabel.appendChild(signOldStepInput);
-    signParamsRow.append(signDailyIdLabel, signOldStepLabel);
+    signParamsRow.append(signDailyIdModeLabel, signDailyIdLabel, signOldStepLabel);
 
     const signModeRow = document.createElement('div');
     signModeRow.className = 'jm-form-row';
@@ -2209,6 +2339,7 @@
         dailySignUsername: String(signUsernameInput.value || '').trim(),
         dailySignPassword: String(signPasswordInput.value || '').trim(),
         dailySignDailyId: String(signDailyIdInput.value || '').trim(),
+        dailySignDailyIdMode: signDailyIdModeSelect.value === 'auto' ? 'auto' : 'manual',
         dailySignOldStep: String(signOldStepInput.value || '').trim(),
         dailySignMode: signModeSelect.value === 'xhr' ? 'xhr' : 'tab',
         dailySignTabActive: signModeRow.querySelector('input[data-sign-tab-active]').checked,
@@ -3233,11 +3364,12 @@
   function init() {
     addToastStyles();
     applyDailySignCamouflageIfNeeded(getSettings());
-    if (runDailySignWorkerIfNeeded()) {
-      return;
-    }
+    const inWorkerMode = runDailySignWorkerIfNeeded();
     applyUiMemoryToState();
     registerMenus();
+    if (inWorkerMode) {
+      return;
+    }
     triggerDailySign();
 
     if (!isDomainApproved()) {
